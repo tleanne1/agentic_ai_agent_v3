@@ -1,104 +1,314 @@
-from colorama import Fore, Style
+# GUARDRAILS.py
+# -------------------------------------------------------------------
+# Guardrails for:
+# - Allowed tables + allowed fields (allowlist)
+# - Field normalization (aliases)
+# - Safe validation:
+#     strict=True  -> raise SystemExit on invalid
+#     strict=False -> auto-prune invalid + continue (recommended for LLM output)
+# - Prompt injection / raw KQL detection
+# - Model allowlist
+# -------------------------------------------------------------------
+
 import re
+from typing import Optional, Set, Union, List, Dict, Tuple
+from colorama import Fore, Style
 
-# Allowed tables and fields returned by tool-selection step.
-# Keep this in sync with PROMPT_MANAGEMENT.TOOLS (and expand over time).
-# If fields are None => allow any fields (broad schema)
-ALLOWED_TABLES = {
-    # MDE Advanced Hunting
+
+# ----------------------------
+# Allowed tables and fields
+# ----------------------------
+# If fields are None => broad schema allowed (skip field validation)
+ALLOWED_TABLES: Dict[str, Optional[Set[str]]] = {
+    "DeviceLogonEvents": {
+        "TimeGenerated", "Timestamp",
+        "AccountName", "AccountDomain", "AccountSid",
+        "DeviceName",
+        "ActionType", "LogonType", "FailureReason",
+        "RemoteIP", "RemotePort",
+        "RemoteDeviceName",
+    },
+
     "DeviceProcessEvents": {
-        "TimeGenerated",
-        "DeviceName",
-        "AccountName",
-        "ActionType",
-        "FileName",                         # ✅ common “process name” equivalent
-        "FolderPath",
-        "SHA256",
+        "TimeGenerated", "Timestamp",
+        "DeviceName", "ActionType",
+        "FileName", "FolderPath",
         "ProcessCommandLine",
+        "ProcessId", "ParentProcessId",
+        "InitiatingProcessId",
         "InitiatingProcessFileName",
+        "InitiatingProcessFolderPath",
         "InitiatingProcessCommandLine",
+        "AccountName",
         "InitiatingProcessAccountName",
+        # Keep these allowed (some tenants may have them), but we will normalize away from them by default:
+        "InitiatingAccountName",
+        "InitiatingUserName",
+        "InitiatingProcessAccountDomain",
+        "InitiatingProcessAccountSid",
+        "SHA256", "MD5",
     },
+
     "DeviceNetworkEvents": {
-        "TimeGenerated",
-        "ActionType",
-        "DeviceName",
-        "RemoteIP",
-        "RemotePort",
+        "TimeGenerated", "Timestamp",
+        "DeviceName", "ActionType",
+        "RemoteIP", "RemotePort",
+        "LocalIP", "LocalPort",
+        "Protocol",
         "RemoteUrl",
+        "RemoteDeviceName",
+        "RemoteIPType",
+        "InitiatingProcessId",
         "InitiatingProcessFileName",
+        "InitiatingProcessFolderPath",
         "InitiatingProcessCommandLine",
         "InitiatingProcessAccountName",
+        # Keep allowed but normalize away by default:
+        "InitiatingAccountName",
+        "InitiatingUserName",
+        "ProcessId",
     },
-    "DeviceLogonEvents": {"TimeGenerated", "AccountName", "DeviceName", "ActionType", "RemoteIP", "RemoteDeviceName"},
-    "DeviceFileEvents": {"TimeGenerated", "ActionType", "DeviceName", "FileName", "FolderPath", "InitiatingProcessAccountName", "SHA256"},
 
-    # Alert tables (broad schemas differ by tenant)
-    "AlertInfo": None,
-    "AlertEvidence": None,
+    "DeviceFileEvents": {
+        "TimeGenerated", "Timestamp",
+        "DeviceName", "ActionType",
+        "FileName", "FolderPath",
+        "InitiatingProcessAccountName",
+        # Keep allowed but normalize away by default:
+        "InitiatingAccountName",
+        "InitiatingUserName",
+        "InitiatingProcessFileName",
+        "InitiatingProcessFolderPath",
+        "InitiatingProcessCommandLine",
+        "SHA256", "MD5",
+    },
 
-    # Optional / future MDE tables you may add to TOOLS
     "DeviceRegistryEvents": None,
     "DeviceImageLoadEvents": None,
 
-    # Sentinel / Azure tables
-    "AzureNetworkAnalytics_CL": {"TimeGenerated", "FlowType_s", "SrcPublicIPs_s", "DestIP_s", "DestPort_d", "VM_s", "AllowedInFlows_d", "AllowedOutFlows_d", "DeniedInFlows_d", "DeniedOutFlows_d"},
-    "AzureActivity": {"TimeGenerated", "OperationNameValue", "ActivityStatusValue", "ResourceGroup", "Caller", "CallerIpAddress", "Category"},
-    "SigninLogs": {"TimeGenerated", "UserPrincipalName", "OperationName", "Category", "ResultSignature", "ResultDescription", "AppDisplayName", "IPAddress", "LocationDetails"},
+    "AlertInfo": None,
+    "AlertEvidence": None,
 
-    # Entra ID tables (broad schemas)
+    "AzureNetworkAnalytics_CL": {
+        "TimeGenerated", "FlowType_s",
+        "SrcPublicIPs_s", "DestIP_s", "DestPort_d",
+        "VM_s",
+        "AllowedInFlows_d", "AllowedOutFlows_d",
+        "DeniedInFlows_d", "DeniedOutFlows_d",
+    },
+
+    "AzureActivity": {
+        "TimeGenerated",
+        "OperationNameValue", "ActivityStatusValue",
+        "ResourceGroup",
+        "Caller", "CallerIpAddress",
+        "Category",
+    },
+
+    "SigninLogs": {
+        "TimeGenerated",
+        "UserPrincipalName",
+        "OperationName",
+        "Category",
+        "ResultSignature", "ResultDescription",
+        "AppDisplayName",
+        "IPAddress",
+        "LocationDetails",
+    },
+
     "AuditLogs": None,
 }
 
-# Model allowlist
-ALLOWED_MODELS = {
-    "gpt-4.1-nano": {"max_input_tokens": 1_047_576, "max_output_tokens": 32_768,  "cost_per_million_input": 0.10, "cost_per_million_output": 0.40,  "tier": {"free": 40_000, "1": 200_000, "2": 2_000_000, "3": 4_000_000, "4": 10_000_000, "5": 150_000_000}},
-    "gpt-4.1":      {"max_input_tokens": 1_047_576, "max_output_tokens": 32_768,  "cost_per_million_input": 1.00, "cost_per_million_output": 8.00,  "tier": {"free": None,   "1": 30_000,  "2": 450_000,   "3": 800_000,   "4": 2_000_000,  "5": 30_000_000}},
-    "gpt-5-mini":   {"max_input_tokens": 272_000,   "max_output_tokens": 128_000, "cost_per_million_input": 0.25, "cost_per_million_output": 2.00,  "tier": {"free": None,   "1": 200_000, "2": 2_000_000, "3": 4_000_000, "4": 10_000_000, "5": 180_000_000}},
-    "gpt-5":        {"max_input_tokens": 272_000,   "max_output_tokens": 128_000, "cost_per_million_input": 1.25, "cost_per_million_output": 10.00, "tier": {"free": None,   "1": 30_000,  "2": 450_000,   "3": 800_000,   "4": 2_000_000,  "5": 40_000_000}},
+
+# ----------------------------
+# Field aliases (fix common LLM mistakes)
+# ----------------------------
+FIELD_ALIASES_BY_TABLE: Dict[str, Dict[str, str]] = {
+    "DeviceLogonEvents": {
+        "ActivityStatusValue": "ActionType",
+        "UserPrincipalName": "AccountName",
+        "Username": "AccountName",
+        "UserName": "AccountName",
+        "IPAddress": "RemoteIP",
+        "IpAddress": "RemoteIP",
+        "DestinationIp": "RemoteIP",
+        "DestinationIP": "RemoteIP",
+    },
+
+    "DeviceProcessEvents": {
+        "InitiatingUser": "InitiatingUserName",
+        "InitiatingUsername": "InitiatingUserName",
+
+        # ✅ IMPORTANT FIX:
+        # Many tenants do NOT have InitiatingAccountName. Prefer InitiatingProcessAccountName.
+        "InitiatingAccount": "InitiatingProcessAccountName",
+        "InitiatingAccountName": "InitiatingProcessAccountName",
+
+        "UserPrincipalName": "AccountName",
+        "Username": "AccountName",
+        "UserName": "AccountName",
+        "ProcessName": "FileName",
+        "Process": "FileName",
+        "CommandLine": "ProcessCommandLine",
+        "InitiatingProcessID": "InitiatingProcessId",
+        "InitiatingProcessId": "InitiatingProcessId",
+    },
+
+    "DeviceNetworkEvents": {
+        "InitiatingUser": "InitiatingUserName",
+        "InitiatingUsername": "InitiatingUserName",
+
+        # ✅ IMPORTANT FIX:
+        "InitiatingAccount": "InitiatingProcessAccountName",
+        "InitiatingAccountName": "InitiatingProcessAccountName",
+
+        "DestinationDeviceName": "RemoteDeviceName",
+        "DestPort": "RemotePort",
+        "DestinationPort": "RemotePort",
+        "DestIP": "RemoteIP",
+        "DestinationIP": "RemoteIP",
+        "DestinationIp": "RemoteIP",
+        "Url": "RemoteUrl",
+        "SourceIp": "LocalIP",
+        "SourceIP": "LocalIP",
+    },
+
+    "DeviceFileEvents": {
+        "InitiatingUser": "InitiatingUserName",
+        "InitiatingUsername": "InitiatingUserName",
+        "UserName": "InitiatingUserName",
+        "Username": "InitiatingUserName",
+
+        # ✅ IMPORTANT FIX:
+        "InitiatingAccount": "InitiatingProcessAccountName",
+        "InitiatingAccountName": "InitiatingProcessAccountName",
+
+        "FilePath": "FolderPath",
+        "Hash": "SHA256",
+    },
 }
 
-def validate_tables_and_fields(table, fields):
+
+# ----------------------------
+# Model allowlist (simple)
+# ----------------------------
+ALLOWED_MODELS = {
+    "gpt-4.1-nano": {"max_input_tokens": 1_047_576},
+    "gpt-4.1":      {"max_input_tokens": 1_047_576},
+    "gpt-5-mini":   {"max_input_tokens": 272_000},
+    "gpt-5":        {"max_input_tokens": 272_000},
+}
+
+
+# ----------------------------
+# Field list helpers
+# ----------------------------
+def _normalize_field_list(fields: Union[str, list]) -> List[str]:
+    if isinstance(fields, list):
+        return [str(f).strip() for f in fields if str(f).strip()]
+    return [f.strip() for f in str(fields).split(",") if f.strip()]
+
+
+def normalize_fields(table: str, fields: Union[str, list]) -> List[str]:
+    """
+    Canonicalize field list:
+    - apply aliases (DestinationPort -> RemotePort, ProcessName -> FileName, etc.)
+    - de-dupe while preserving order
+    """
+    raw = _normalize_field_list(fields)
+    alias_map = FIELD_ALIASES_BY_TABLE.get(table, {})
+
+    out: List[str] = []
+    seen = set()
+
+    for f in raw:
+        canonical = alias_map.get(f, f)
+        if canonical not in seen:
+            out.append(canonical)
+            seen.add(canonical)
+
+    if raw != out:
+        print(
+            f"{Fore.YELLOW}[i] Normalized fields for {table}: "
+            f"{Fore.WHITE}{', '.join(raw)} {Fore.YELLOW}→ {Fore.WHITE}{', '.join(out)}{Style.RESET_ALL}"
+        )
+
+    return out
+
+
+def coerce_fields_to_allowed(table: str, fields: Union[str, list]) -> Tuple[List[str], List[str]]:
+    """
+    Normalize + prune invalid fields (non-fatal).
+    Returns: (clean_fields, dropped_fields)
+    """
+    allowed = ALLOWED_TABLES.get(table)
+    normalized = normalize_fields(table, fields)
+
+    if allowed is None:
+        return normalized, []
+
+    clean: List[str] = []
+    dropped: List[str] = []
+    for f in normalized:
+        if f in allowed:
+            clean.append(f)
+        else:
+            dropped.append(f)
+
+    # If everything got dropped, fall back to safe defaults
+    if not clean:
+        fallback_defaults = {
+            "DeviceLogonEvents": ["TimeGenerated", "AccountName", "DeviceName", "ActionType", "RemoteIP", "RemoteDeviceName"],
+            "DeviceProcessEvents": ["TimeGenerated", "DeviceName", "FileName", "ProcessCommandLine", "AccountName"],
+            "DeviceNetworkEvents": ["TimeGenerated", "DeviceName", "LocalIP", "RemoteIP", "RemotePort", "Protocol"],
+            "DeviceFileEvents": ["TimeGenerated", "DeviceName", "ActionType", "FileName", "FolderPath", "SHA256"],
+        }
+        clean = fallback_defaults.get(table, normalized[:6] or [])
+
+    return clean, dropped
+
+
+def validate_tables_and_fields(table: str, fields: Union[str, list], *, strict: bool = True) -> List[str]:
+    """
+    strict=True  -> raise SystemExit for invalid fields/tables
+    strict=False -> prune invalid fields and continue
+    """
     print(f"{Fore.LIGHTGREEN_EX}Validating Tables and Fields...{Style.RESET_ALL}")
 
     if table not in ALLOWED_TABLES:
-        msg = f"Table '{table}' is not in allowed list"
-        print(f"{Fore.RED}{Style.BRIGHT}ERROR: {msg}{Style.RESET_ALL}")
-        raise ValueError(msg)
+        print(f"{Fore.RED}{Style.BRIGHT}ERROR: Table '{table}' is not allowed.{Style.RESET_ALL}")
+        raise SystemExit(1)
 
     allowed_fields = ALLOWED_TABLES.get(table)
 
-    # If None, allow any fields (broad schema)
     if allowed_fields is None:
-        print(f"{Fore.WHITE}Table '{table}' is allowed. Field validation skipped (broad schema).\n{Style.RESET_ALL}")
-        return
+        cleaned = normalize_fields(table, fields)
+        print(f"{Fore.WHITE}Table '{table}' allowed. Field validation skipped (broad schema).\n{Style.RESET_ALL}")
+        return cleaned
 
-    # Normalize fields -> list[str]
-    if isinstance(fields, list):
-        field_list = [str(f).strip() for f in fields if str(f).strip()]
-    else:
-        field_list = [f.strip() for f in str(fields).split(",") if f.strip()]
+    cleaned, dropped = coerce_fields_to_allowed(table, fields)
 
-    for field in field_list:
-        if field not in allowed_fields:
-            msg = f"Field '{field}' is not allowed for table '{table}'"
-            print(f"{Fore.RED}{Style.BRIGHT}ERROR: {msg}{Style.RESET_ALL}")
-            raise ValueError(msg)
+    if dropped:
+        print(f"{Fore.YELLOW}[i] Dropped invalid field(s) for {table}: {Fore.WHITE}{', '.join(dropped)}{Style.RESET_ALL}")
+        if strict:
+            print(f"{Fore.RED}{Style.BRIGHT}ERROR: Invalid fields for '{table}' (strict mode).{Style.RESET_ALL}")
+            raise SystemExit(1)
 
     print(f"{Fore.WHITE}Fields and tables validated.\n{Style.RESET_ALL}")
+    return cleaned
 
-def validate_model(model):
+
+def validate_model(model: str) -> None:
     if model not in ALLOWED_MODELS:
-        msg = f"Model '{model}' is not allowed"
-        print(f"{Fore.RED}{Style.BRIGHT}ERROR: {msg}{Style.RESET_ALL}")
-        raise ValueError(msg)
-    else:
-        print(f"{Fore.LIGHTGREEN_EX}Selected model is valid: {Fore.CYAN}{model}\n{Style.RESET_ALL}")
+        print(f"{Fore.RED}{Style.BRIGHT}ERROR: Model '{model}' is not allowed.{Style.RESET_ALL}")
+        raise SystemExit(1)
+
+    print(f"{Fore.LIGHTGREEN_EX}Selected model is valid: {Fore.CYAN}{model}{Style.RESET_ALL}")
+
 
 # ----------------------------
-# Prompt-injection / KQL-injection detection
+# Prompt/KQL injection detection
 # ----------------------------
-
 _KQL_MARKERS = [
     "|", "project", "where", "summarize", "extend", "join", "union",
     "datatable", "externaldata", "invoke", "let", "print", "take", "top",
@@ -110,34 +320,27 @@ _INJECTION_MARKERS = [
     "you are not", "act as", "simulate", "reveal", "exfiltrate", "bypass guardrails"
 ]
 
-def detect_prompt_injection(user_prompt: str):
-    """
-    Returns list[str] reasons if suspicious, else [].
-    Conservative by design: blocks raw KQL pipes + common injection strings.
-    """
+
+def detect_prompt_injection(user_prompt: str) -> list:
     if not user_prompt:
         return []
 
     p = user_prompt.lower()
     reasons = []
 
-    # KQL pipe operator
     if "|" in user_prompt:
         reasons.append("contains pipe operator '|'")
 
-    # KQL keywords
     for kw in _KQL_MARKERS:
         if re.search(rf"\b{re.escape(kw)}\b", p):
             reasons.append(f"contains KQL keyword '{kw}'")
             break
 
-    # Prompt-injection patterns
     for kw in _INJECTION_MARKERS:
         if kw in p:
             reasons.append(f"contains injection phrase '{kw}'")
             break
 
-    # Attempts to smuggle tool params as JSON
     if '"table_name"' in p or '"fields"' in p or '"time_range_hours"' in p:
         reasons.append("contains tool-parameter JSON-like content")
 
