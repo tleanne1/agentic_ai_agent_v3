@@ -11,10 +11,7 @@ from colorama import Fore, Style
 # Logging
 # ----------------------------
 
-# Writes JSONL (one JSON object per line). Easy to parse later.
 LOG_FILE = os.getenv("AGENT_LOG_FILE", "agent_events.jsonl")
-
-# Toggle: log raw Log Analytics CSV payloads (can be large and sensitive)
 LOG_RAW_RECORDS = os.getenv("AGENT_LOG_RAW_RECORDS", "0").strip().lower() in {"1", "true", "yes", "y"}
 
 
@@ -23,10 +20,6 @@ def _utc_iso() -> str:
 
 
 def log_event(event_type: str, payload: dict):
-    """
-    Append a structured event to a local JSONL file.
-    Never crash the agent due to logging errors.
-    """
     rec = {"ts": _utc_iso(), "event": event_type, "payload": payload or {}}
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -43,14 +36,6 @@ _SUSPICIOUS_CHARS = re.compile(r"[|;`$<>]")
 
 
 def sanitize_literal(value: str, *, max_len: int = 128) -> str:
-    """
-    Defang values that get interpolated into KQL string literals.
-
-    - Strips newlines
-    - Removes characters commonly used for KQL injection / command chaining
-    - Removes quotes
-    - Truncates to max_len
-    """
     if value is None:
         return ""
 
@@ -62,14 +47,47 @@ def sanitize_literal(value: str, *, max_len: int = 128) -> str:
     return v
 
 
+# ----------------------------
+# Field aliasing (planner/tool resilience)
+# ----------------------------
+
+FIELD_ALIASES = {
+    "DeviceProcessEvents": {
+        "ProcessName": "FileName",
+        "ParentProcessName": "InitiatingProcessFileName",
+        "CommandLine": "ProcessCommandLine",
+        "ParentCommandLine": "InitiatingProcessCommandLine",
+    },
+    "DeviceNetworkEvents": {
+        "DestinationIp": "RemoteIP",
+        "DestinationIP": "RemoteIP",
+        "DestinationPort": "RemotePort",
+        "DestPort": "RemotePort",
+        "Url": "RemoteUrl",
+        "URL": "RemoteUrl",
+    },
+    "DeviceLogonEvents": {
+        "UserName": "AccountName",
+        "Username": "AccountName",
+        "SourceIP": "RemoteIP",
+    },
+}
+
+def normalize_fields_for_table(table_name: str, fields: str) -> str:
+    parts = [p.strip() for p in str(fields).split(",") if p.strip()]
+    aliases = FIELD_ALIASES.get(table_name, {})
+    normalized = [aliases.get(p, p) for p in parts]
+
+    out = []
+    for f in normalized:
+        if f not in out:
+            out.append(f)
+    return ", ".join(out)
+
+
 def sanitize_query_context(query_context: dict) -> dict:
-    """
-    Normalizes tool-selection output and makes it safer for KQL templating.
-    This matches your EXECUTOR.query_log_analytics signature.
-    """
     qc = dict(query_context or {})
 
-    # Defaults expected by your pipeline
     qc.setdefault("table_name", "")
     qc.setdefault("device_name", "")
     qc.setdefault("caller", "")
@@ -81,12 +99,10 @@ def sanitize_query_context(query_context: dict) -> dict:
     qc.setdefault("about_network_security_group", False)
     qc.setdefault("rationale", "")
 
-    # Sanitize interpolated values
     qc["device_name"] = sanitize_literal(qc.get("device_name", ""))
     qc["caller"] = sanitize_literal(qc.get("caller", ""))
     qc["user_principal_name"] = sanitize_literal(qc.get("user_principal_name", ""))
 
-    # Normalize fields -> ensure string "a, b, c" because your EXECUTOR joins it into `project ...`
     fields = qc.get("fields", [])
     if isinstance(fields, list):
         fields = [str(f).strip() for f in fields if str(f).strip()]
@@ -94,7 +110,8 @@ def sanitize_query_context(query_context: dict) -> dict:
     else:
         qc["fields"] = ", ".join([f.strip() for f in str(fields).split(",") if f.strip()])
 
-    # Normalize time_range_hours
+    qc["fields"] = normalize_fields_for_table(qc.get("table_name", ""), qc.get("fields", ""))
+
     try:
         qc["time_range_hours"] = int(qc.get("time_range_hours", 96))
     except Exception:

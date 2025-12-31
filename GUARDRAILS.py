@@ -6,8 +6,30 @@ import re
 # If fields are None => allow any fields (broad schema)
 ALLOWED_TABLES = {
     # MDE Advanced Hunting
-    "DeviceProcessEvents": {"TimeGenerated", "AccountName", "ActionType", "DeviceName", "InitiatingProcessCommandLine", "ProcessCommandLine"},
-    "DeviceNetworkEvents": {"TimeGenerated", "ActionType", "DeviceName", "RemoteIP", "RemotePort"},
+    "DeviceProcessEvents": {
+        "TimeGenerated",
+        "DeviceName",
+        "AccountName",
+        "ActionType",
+        "FileName",                         # ✅ common “process name” equivalent
+        "FolderPath",
+        "SHA256",
+        "ProcessCommandLine",
+        "InitiatingProcessFileName",
+        "InitiatingProcessCommandLine",
+        "InitiatingProcessAccountName",
+    },
+    "DeviceNetworkEvents": {
+        "TimeGenerated",
+        "ActionType",
+        "DeviceName",
+        "RemoteIP",
+        "RemotePort",
+        "RemoteUrl",
+        "InitiatingProcessFileName",
+        "InitiatingProcessCommandLine",
+        "InitiatingProcessAccountName",
+    },
     "DeviceLogonEvents": {"TimeGenerated", "AccountName", "DeviceName", "ActionType", "RemoteIP", "RemoteDeviceName"},
     "DeviceFileEvents": {"TimeGenerated", "ActionType", "DeviceName", "FileName", "FolderPath", "InitiatingProcessAccountName", "SHA256"},
 
@@ -40,8 +62,9 @@ def validate_tables_and_fields(table, fields):
     print(f"{Fore.LIGHTGREEN_EX}Validating Tables and Fields...{Style.RESET_ALL}")
 
     if table not in ALLOWED_TABLES:
-        print(f"{Fore.RED}{Style.BRIGHT}ERROR: Table '{table}' is not in allowed list — exiting.{Style.RESET_ALL}")
-        raise SystemExit(1)
+        msg = f"Table '{table}' is not in allowed list"
+        print(f"{Fore.RED}{Style.BRIGHT}ERROR: {msg}{Style.RESET_ALL}")
+        raise ValueError(msg)
 
     allowed_fields = ALLOWED_TABLES.get(table)
 
@@ -54,19 +77,21 @@ def validate_tables_and_fields(table, fields):
     if isinstance(fields, list):
         field_list = [str(f).strip() for f in fields if str(f).strip()]
     else:
-        field_list = [f.strip() for f in str(fields).replace(" ", "").split(",") if f.strip()]
+        field_list = [f.strip() for f in str(fields).split(",") if f.strip()]
 
     for field in field_list:
         if field not in allowed_fields:
-            print(f"{Fore.RED}{Style.BRIGHT}ERROR: Field '{field}' is not allowed for table '{table}' — exiting.{Style.RESET_ALL}")
-            raise SystemExit(1)
+            msg = f"Field '{field}' is not allowed for table '{table}'"
+            print(f"{Fore.RED}{Style.BRIGHT}ERROR: {msg}{Style.RESET_ALL}")
+            raise ValueError(msg)
 
     print(f"{Fore.WHITE}Fields and tables validated.\n{Style.RESET_ALL}")
 
 def validate_model(model):
     if model not in ALLOWED_MODELS:
-        print(f"{Fore.RED}{Style.BRIGHT}ERROR: Model '{model}' is not allowed — exiting.{Style.RESET_ALL}")
-        raise SystemExit(1)
+        msg = f"Model '{model}' is not allowed"
+        print(f"{Fore.RED}{Style.BRIGHT}ERROR: {msg}{Style.RESET_ALL}")
+        raise ValueError(msg)
     else:
         print(f"{Fore.LIGHTGREEN_EX}Selected model is valid: {Fore.CYAN}{model}\n{Style.RESET_ALL}")
 

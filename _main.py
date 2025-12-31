@@ -15,7 +15,8 @@ import MODEL_MANAGEMENT
 import PROMPT_MANAGEMENT
 import EXECUTOR
 import GUARDRAILS
-import BASELINES  # ✅ NEW
+import BASELINES
+import PLANNER  # ✅ NEW
 
 # Local config (non-secret)
 from _config import LOG_ANALYTICS_WORKSPACE_ID  # <- if you rename to config.py, change this import
@@ -45,7 +46,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
     """
     One full iteration:
-      user -> tool-selection -> query -> threat hunt -> display -> (optional remediation)
+      user -> tool-selection -> query -> baseline -> planner pivots -> threat hunt -> (optional remediation)
     Returns: "continue" | "quit"
     """
 
@@ -111,7 +112,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
     GUARDRAILS.validate_tables_and_fields(query_context.get("table_name", ""), query_context.get("fields", ""))
 
     # ----------------------------
-    # Query Log Analytics
+    # Query Log Analytics (initial)
     # ----------------------------
     try:
         law_query_results = EXECUTOR.query_log_analytics(
@@ -146,7 +147,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
         return "continue"
 
     # ----------------------------
-    # Baseline memory update + anomaly summary ✅ NEW
+    # Baseline memory update + anomaly summary
     # ----------------------------
     baseline_note = ""
     try:
@@ -154,17 +155,17 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
             table_name=query_context["table_name"],
             query_context=query_context,
             records_csv=law_query_results.get("records", ""),
-            record_count=number_of_records
+            record_count=number_of_records,
         )
 
-        # Higher sensitivity during early learning
+        # Moderate sensitivity (you can tune later)
         baseline_note = BASELINES.anomaly_summary(
             table_name=query_context["table_name"],
             query_context=query_context,
             records_csv=law_query_results.get("records", ""),
             record_count=number_of_records,
             min_run_count=1,
-            rarity_threshold=0.02
+            rarity_threshold=0.02,
         )
 
         if baseline_note:
@@ -178,19 +179,48 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
                 "table": query_context["table_name"],
                 "updated": meta.get("updated"),
                 "columns": meta.get("columns"),
-            }
+            },
         )
 
     except Exception as e:
         UTILITIES.log_event("baseline_error", {"error": str(e)})
 
     # ----------------------------
+    # Planner pivots (NEW)
+    # ----------------------------
+    # Use a cheaper model for planning
+    planner_model = "gpt-4.1-nano"
+
+    pivot_blocks = ""
+    try:
+        plan_out = PLANNER.run_planner_pivots(
+            openai_client=openai_client,
+            planner_model=planner_model,
+            user_prompt=user_prompt,
+            initial_query_context=query_context,
+            baseline_note=baseline_note,
+            query_runner_fn=EXECUTOR.query_log_analytics,
+            log_workspace_id=LOG_ANALYTICS_WORKSPACE_ID,
+            log_client=law_client,
+        )
+
+        pivot_blocks = plan_out.get("pivot_blocks") or ""
+        if pivot_blocks:
+            print(Fore.LIGHTMAGENTA_EX + "\n🧠 Planner Pivot Evidence:" + Style.RESET_ALL)
+            print(Fore.WHITE + pivot_blocks + Style.RESET_ALL + "\n")
+
+    except Exception as e:
+        UTILITIES.log_event("planner_fatal", {"error": str(e)})
+        pivot_blocks = ""
+
+    # ----------------------------
     # Build threat hunt prompt + run model
     # ----------------------------
-    # If we have baseline context, append it to the analyst prompt so the LLM prioritizes anomalies.
     final_user_prompt = user_prompt
     if baseline_note:
-        final_user_prompt = user_prompt + "\n\n" + baseline_note
+        final_user_prompt += "\n\n" + baseline_note
+    if pivot_blocks:
+        final_user_prompt += "\n\n" + pivot_blocks
 
     threat_hunt_user_message = PROMPT_MANAGEMENT.build_threat_hunt_prompt(
         user_prompt=final_user_prompt,
@@ -215,11 +245,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
 
     UTILITIES.log_event(
         "model_selection",
-        {
-            "input_tokens_estimate": number_of_tokens,
-            "record_count": number_of_records,
-            "selected_model": model,
-        },
+        {"input_tokens_estimate": number_of_tokens, "record_count": number_of_records, "selected_model": model},
     )
 
     print(
@@ -258,9 +284,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
         },
     )
 
-    input(
-        f"Press {Fore.LIGHTGREEN_EX}[Enter]{Fore.WHITE} or {Fore.LIGHTGREEN_EX}[Return]{Fore.WHITE} to see results."
-    )
+    input(f"Press {Fore.LIGHTGREEN_EX}[Enter]{Fore.WHITE} to see results.")
     UTILITIES.display_threats(threat_list=findings)
 
     # ----------------------------
@@ -272,7 +296,6 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
     query_is_about_individual_user = bool(query_context.get("about_individual_user"))
     query_is_about_network_security_group = bool(query_context.get("about_network_security_group"))
 
-    # Host isolation rule: only ask once per run if a High confidence threat is present.
     if query_is_about_individual_host:
         for threat in findings:
             threat_confidence_is_high = (threat.get("confidence") or "").lower() == "high"
@@ -286,15 +309,12 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
                 )
                 print(Fore.LIGHTRED_EX + (threat.get("title") or "Untitled threat") + Style.RESET_ALL)
 
-                confirm = input(
-                    f"{Fore.RED}{Style.BRIGHT}Would you like to isolate this VM? (yes/no): {Style.RESET_ALL}"
-                ).strip().lower()
+                confirm = input(f"{Fore.RED}{Style.BRIGHT}Would you like to isolate this VM? (yes/no): {Style.RESET_ALL}").strip().lower()
 
                 if confirm.startswith("y"):
                     try:
                         isolated_machine_id = EXECUTOR.get_mde_workstation_id_from_name(
-                            token=token,
-                            device_name=query_context["device_name"],
+                            token=token, device_name=query_context["device_name"]
                         )
 
                         isolate_result = EXECUTOR.isolate_virtual_machine(
@@ -306,11 +326,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
 
                         UTILITIES.log_event(
                             "remediation_isolate_attempt",
-                            {
-                                "device_name": query_context["device_name"],
-                                "machine_id": isolated_machine_id,
-                                "result": isolate_result,
-                            },
+                            {"device_name": query_context["device_name"], "machine_id": isolated_machine_id, "result": isolate_result},
                         )
 
                         if isolate_result.get("ok"):
@@ -322,22 +338,12 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
 
                             action_id = machine_state.get("last_isolation_action_id")
                             if action_id:
-                                final = EXECUTOR.poll_machine_action(
-                                    token=token,
-                                    action_id=action_id,
-                                    timeout_seconds=90,
-                                    interval_seconds=5,
-                                )
+                                final = EXECUTOR.poll_machine_action(token=token, action_id=action_id, timeout_seconds=90, interval_seconds=5)
                                 status = (final.get("body") or {}).get("status") or (final.get("body") or {}).get("Status")
                                 if status:
                                     print(Fore.CYAN + f"[i] Isolation final status: {status}" + Style.RESET_ALL)
-
                         else:
-                            print(
-                                Fore.LIGHTRED_EX
-                                + f"[-] Isolation failed (HTTP {isolate_result.get('status_code')})."
-                                + Style.RESET_ALL
-                            )
+                            print(Fore.LIGHTRED_EX + f"[-] Isolation failed (HTTP {isolate_result.get('status_code')})." + Style.RESET_ALL)
 
                     except Exception as e:
                         UTILITIES.log_event("remediation_isolate_error", {"error": str(e)})
@@ -345,22 +351,15 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
                 else:
                     print(Fore.CYAN + "[i] Isolation skipped by user." + Style.RESET_ALL)
 
-                # Only ask once per iteration
                 break
 
     elif query_is_about_individual_user:
-        # Stub for future: disable user, reset password, revoke sessions, etc.
         pass
-
     elif query_is_about_network_security_group:
-        # Stub for future: create NSG deny rule for malicious flow, etc.
         pass
 
-    # Offer end-of-iteration unisolate if still isolated
     if machine_state.get("machine_is_isolated") and machine_state.get("isolated_machine_id"):
-        release_end = input(
-            f"{Fore.YELLOW}VM is currently isolated. Release it now? (yes/no): {Style.RESET_ALL}"
-        ).strip().lower()
+        release_end = input(f"{Fore.YELLOW}VM is currently isolated. Release it now? (yes/no): {Style.RESET_ALL}").strip().lower()
         if release_end.startswith("y"):
             un_result = EXECUTOR.unisolate_virtual_machine(
                 token=token,
@@ -370,22 +369,14 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
 
             UTILITIES.log_event(
                 "remediation_unisolate_attempt",
-                {
-                    "device_name": query_context.get("device_name"),
-                    "machine_id": machine_state["isolated_machine_id"],
-                    "result": un_result,
-                },
+                {"device_name": query_context.get("device_name"), "machine_id": machine_state["isolated_machine_id"], "result": un_result},
             )
 
             if un_result.get("ok"):
                 machine_state["machine_is_isolated"] = False
                 print(Fore.GREEN + "[+] VM successfully released from isolation." + Style.RESET_ALL)
             else:
-                print(
-                    Fore.LIGHTRED_EX
-                    + f"[-] Failed to release from isolation (HTTP {un_result.get('status_code')})."
-                    + Style.RESET_ALL
-                )
+                print(Fore.LIGHTRED_EX + f"[-] Failed to release from isolation (HTTP {un_result.get('status_code')})." + Style.RESET_ALL)
 
     return "continue"
 
@@ -394,9 +385,7 @@ def main():
     UTILITIES.print_banner()
     print(Fore.WHITE + "Type 'help' for commands. Type 'quit' any time to exit.\n" + Style.RESET_ALL)
 
-    # Keep remediation state across iterations
     machine_state = {"machine_is_isolated": False, "isolated_machine_id": None, "last_isolation_action_id": None}
-
     model_default = MODEL_MANAGEMENT.DEFAULT_MODEL
 
     while True:
@@ -405,10 +394,8 @@ def main():
             if action == "quit":
                 break
 
-            # After each iteration: ask what next
             nxt = input(
-                f"{Fore.LIGHTBLUE_EX}\nWhat next? "
-                f"{Fore.WHITE}(Enter=another hunt / 'release'=release isolated VM / 'quit'):{Fore.RESET} "
+                f"{Fore.LIGHTBLUE_EX}\nWhat next? {Fore.WHITE}(Enter=another hunt / 'release'=release isolated VM / 'quit'):{Fore.RESET} "
             ).strip().lower()
 
             if nxt in {"q", "quit", "exit"}:
@@ -428,18 +415,12 @@ def main():
                             machine_state["machine_is_isolated"] = False
                             print(Fore.GREEN + "[+] VM successfully released from isolation." + Style.RESET_ALL)
                         else:
-                            print(
-                                Fore.LIGHTRED_EX
-                                + f"[-] Failed to release from isolation (HTTP {un_result.get('status_code')})."
-                                + Style.RESET_ALL
-                            )
+                            print(Fore.LIGHTRED_EX + f"[-] Failed to release from isolation (HTTP {un_result.get('status_code')})." + Style.RESET_ALL)
                     except Exception as e:
                         UTILITIES.log_event("remediation_unisolate_error", {"error": str(e)})
                         print(Fore.LIGHTRED_EX + f"[-] Release failed: {e}" + Style.RESET_ALL)
                 else:
                     print(Fore.YELLOW + "No VM is currently isolated in this session." + Style.RESET_ALL)
-
-            # else: Enter -> continue loop
 
         except KeyboardInterrupt:
             print(Fore.YELLOW + "\nInterrupted. Exiting." + Style.RESET_ALL)
