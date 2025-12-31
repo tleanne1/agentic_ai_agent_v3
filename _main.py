@@ -15,6 +15,7 @@ import MODEL_MANAGEMENT
 import PROMPT_MANAGEMENT
 import EXECUTOR
 import GUARDRAILS
+import BASELINES  # ✅ NEW
 
 # Local config (non-secret)
 from _config import LOG_ANALYTICS_WORKSPACE_ID  # <- if you rename to config.py, change this import
@@ -145,10 +146,54 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
         return "continue"
 
     # ----------------------------
+    # Baseline memory update + anomaly summary ✅ NEW
+    # ----------------------------
+    baseline_note = ""
+    try:
+        meta = BASELINES.update_baseline_from_csv(
+            table_name=query_context["table_name"],
+            query_context=query_context,
+            records_csv=law_query_results.get("records", ""),
+            record_count=number_of_records
+        )
+
+        # Higher sensitivity during early learning
+        baseline_note = BASELINES.anomaly_summary(
+            table_name=query_context["table_name"],
+            query_context=query_context,
+            records_csv=law_query_results.get("records", ""),
+            record_count=number_of_records,
+            min_run_count=1,
+            rarity_threshold=0.02
+        )
+
+        if baseline_note:
+            print(Fore.LIGHTYELLOW_EX + "\n⚡ Baseline Anomaly Summary:" + Style.RESET_ALL)
+            print(Fore.WHITE + baseline_note + Style.RESET_ALL + "\n")
+
+        UTILITIES.log_event(
+            "baseline_update",
+            {
+                "scope": meta.get("scope_key"),
+                "table": query_context["table_name"],
+                "updated": meta.get("updated"),
+                "columns": meta.get("columns"),
+            }
+        )
+
+    except Exception as e:
+        UTILITIES.log_event("baseline_error", {"error": str(e)})
+
+    # ----------------------------
     # Build threat hunt prompt + run model
     # ----------------------------
+    # If we have baseline context, append it to the analyst prompt so the LLM prioritizes anomalies.
+    final_user_prompt = user_prompt
+    if baseline_note:
+        final_user_prompt = user_prompt + "\n\n" + baseline_note
+
     threat_hunt_user_message = PROMPT_MANAGEMENT.build_threat_hunt_prompt(
-        user_prompt=user_prompt,
+        user_prompt=final_user_prompt,
         table_name=query_context["table_name"],
         log_data=law_query_results["records"],
     )
@@ -163,7 +208,6 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
     model = MODEL_MANAGEMENT.auto_select_model(
         input_tokens=number_of_tokens,
         tier=MODEL_MANAGEMENT.CURRENT_TIER,
-        # heuristic: large record sets -> prefer stronger model
         prefer_quality=(number_of_records >= 5000),
     )
 
