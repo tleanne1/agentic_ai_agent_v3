@@ -1,5 +1,6 @@
 # Standard library
 import json
+import re
 from datetime import datetime, timezone
 from typing import Dict, List, Any
 
@@ -27,11 +28,32 @@ def _normalize_fields(fields) -> str:
     if isinstance(fields, list):
         fields = [str(x).strip() for x in fields if str(x).strip()]
         return ", ".join(fields[:20])  # hard cap
+    # comma-string
     parts = [p.strip() for p in str(fields).split(",") if p.strip()]
     return ", ".join(parts[:20])
 
 
+def _single_value(v: str, *, max_len: int = 80) -> str:
+    """
+    Planner sometimes returns comma-lists. We only support single-value anchors.
+    Keep the first item, strip quotes/spaces, defang, truncate.
+    """
+    if not v:
+        return ""
+    s = str(v).strip().replace('"', "").replace("'", "")
+    if "," in s:
+        s = s.split(",")[0].strip()
+    s = re.sub(r"[|;`$<>]", "", s)
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+
 def _same_scope_guard(initial_qc: dict, qc: dict) -> bool:
+    """
+    Prevent planner from drifting to unrelated scope.
+    Require at least one matching anchor (device/upn/caller) if present initially.
+    """
     init_device = (initial_qc.get("device_name") or "").strip().lower()
     init_upn = (initial_qc.get("user_principal_name") or "").strip().lower()
     init_caller = (initial_qc.get("caller") or "").strip().lower()
@@ -42,8 +64,9 @@ def _same_scope_guard(initial_qc: dict, qc: dict) -> bool:
 
     anchors_present = any([init_device, init_upn, init_caller])
     if not anchors_present:
-        return True
+        return True  # nothing to anchor to
 
+    # If an anchor exists, require at least one overlap
     if init_device and device and device.startswith(init_device):
         return True
     if init_upn and upn and upn.startswith(init_upn):
@@ -55,6 +78,9 @@ def _same_scope_guard(initial_qc: dict, qc: dict) -> bool:
 
 
 def _sanitize_planned_step(step: dict, initial_qc: dict) -> dict:
+    """
+    Enforce allowed schema + safe limits. This is *not* KQL validation — it’s tool-arg validation.
+    """
     qc = dict(step or {})
 
     qc.setdefault("table_name", initial_qc.get("table_name", ""))
@@ -64,6 +90,7 @@ def _sanitize_planned_step(step: dict, initial_qc: dict) -> dict:
     qc.setdefault("user_principal_name", initial_qc.get("user_principal_name", ""))
     qc.setdefault("fields", initial_qc.get("fields", ""))
 
+    # clamp time
     qc["time_range_hours"] = _clamp_int(
         qc.get("time_range_hours"),
         1,
@@ -71,25 +98,39 @@ def _sanitize_planned_step(step: dict, initial_qc: dict) -> dict:
         int(initial_qc.get("time_range_hours") or 24),
     )
 
+    # normalize fields
     qc["fields"] = _normalize_fields(qc.get("fields"))
 
-    # ✅ Apply aliases BEFORE validation (ProcessName -> FileName, etc.)
+    # ✅ Apply aliases BEFORE validation (ProcessName -> FileName, SrcPort -> LocalPort, PID -> ProcessId, etc.)
     qc["fields"] = UTILITIES.normalize_fields_for_table(qc.get("table_name", ""), qc.get("fields", ""))
 
-    # enforce allowlist tables/fields (now raises ValueError, does not kill program)
+    # ✅ enforce single-value anchors (no comma-lists)
+    qc["device_name"] = _single_value(qc.get("device_name", ""))
+    qc["user_principal_name"] = _single_value(qc.get("user_principal_name", ""))
+    qc["caller"] = _single_value(qc.get("caller", ""))
+
+    # enforce allowlist tables/fields
     GUARDRAILS.validate_tables_and_fields(qc.get("table_name", ""), qc.get("fields", ""))
 
+    # enforce scope anchoring
     if not _same_scope_guard(initial_qc, qc):
+        # snap back to initial scope
         qc["device_name"] = initial_qc.get("device_name", "")
         qc["caller"] = initial_qc.get("caller", "")
         qc["user_principal_name"] = initial_qc.get("user_principal_name", "")
 
+    # keep step goal lightweight
     qc["goal"] = (qc.get("goal") or "").strip()[:220]
 
     return qc
 
 
 def _summarize_csv(records_csv: str, max_lines: int = 20) -> str:
+    """
+    Tiny, safe summarizer that doesn’t dump raw logs back into the model.
+    We just keep a few lines (headers + a few rows) so the analyst can see shape,
+    but not enough to blow tokens or leak sensitive data.
+    """
     if not records_csv:
         return ""
 
@@ -97,6 +138,7 @@ def _summarize_csv(records_csv: str, max_lines: int = 20) -> str:
     if not lines:
         return ""
 
+    # Keep header + a few rows
     head = lines[: max_lines]
     snippet = "\n".join(head)
     if len(lines) > max_lines:
@@ -132,6 +174,9 @@ def _format_pivot_block(step_idx: int, qc: dict, record_count: int, preview: str
 
 
 def build_plan(openai_client, *, model: str, user_prompt: str, initial_query_context: dict, baseline_note: str = "") -> List[dict]:
+    """
+    Returns a list of planned pivot steps (each is a query-context dict)
+    """
     system = {
         "role": "system",
         "content": (
@@ -194,11 +239,13 @@ def build_plan(openai_client, *, model: str, user_prompt: str, initial_query_con
     raw = resp.choices[0].message.content
     data = json.loads(raw)
     steps = data.get("steps") or []
+
+    # hard cap to 3 steps
     steps = steps[:3]
 
+    # sanitize each step
     cleaned = []
     for s in steps:
-        # If one step is invalid, log + skip instead of killing the plan
         try:
             cleaned.append(_sanitize_planned_step(s, initial_query_context))
         except Exception as e:
@@ -218,6 +265,15 @@ def run_planner_pivots(
     log_workspace_id: str,
     log_client,
 ) -> Dict[str, Any]:
+    """
+    Builds a plan + executes pivot queries.
+    Returns:
+      {
+        "steps": [cleaned_step_dicts],
+        "pivot_blocks": "string to inject into hunt prompt",
+        "pivot_counts": [ints]
+      }
+    """
     UTILITIES.log_event("planner_start", {"ts": _utc_iso()})
 
     steps = build_plan(
