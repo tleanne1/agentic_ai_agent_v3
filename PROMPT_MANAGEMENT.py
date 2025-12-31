@@ -68,6 +68,7 @@ Schema example (one finding):
         "id": "T1059.001",
         "description": "MITRE mapping"
       },
+      "confirmations": ["pivot", "create incident", "monitor", "ignore"],
       "log_lines": ["Relevant log line(s)"],
       "confidence": "Low | Medium | High",
       "recommendations": ["pivot", "create incident", "monitor", "ignore"],
@@ -189,7 +190,7 @@ TOOLS = [
 
 def get_user_message():
     prompt = ""
-    print("\n" * 20)
+    # Removed excessive startup spacing (was: print("\n" * 20))
 
     user_input = input(
         f"{Fore.LIGHTBLUE_EX}Agentic SOC Analyst at your service! What would you like to do?\n\n{Fore.RESET}"
@@ -202,7 +203,8 @@ def get_user_message():
 
 
 def build_threat_hunt_prompt(user_prompt: str, table_name: str, log_data: str) -> dict:
-    print(f"{Fore.LIGHTGREEN_EX}Building threat hunt prompt/instructions...\n{Fore.RESET}")
+    # NOTE: Printing this here caused duplicate console output because _main.py
+    # also prints the same status line. Keep logging centralized in _main.py.
 
     instructions = THREAT_HUNT_PROMPTS.get(table_name, THREAT_HUNT_PROMPTS["GeneralThreatHunter"])
 

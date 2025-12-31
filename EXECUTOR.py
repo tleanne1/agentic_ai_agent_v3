@@ -10,13 +10,22 @@
 #     ✅ get_mde_workstation_id_from_name() using computerDnsName (fixes HTTP 400 deviceName error)
 #     ✅ isolate_vm_by_name()
 #     ✅ release_vm_by_name()
+#
+# Minimal enterprise polish added:
+#   ✅ In-memory query cache per session
+#   ✅ Cache-hit message instead of re-printing/re-running identical KQL
+#
+# NEW (minimal, high-value reliability fix):
+#   ✅ Auto-retry once WITHOUT projected fields if Log Analytics errors on unknown columns
+#      (e.g., AlertInfo AlertName, DeviceRegistryEvents RegistryPath)
 # -------------------------------------------------------------------
 
 import csv
 import io
 import json
+import re
 from datetime import timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 import requests
 from colorama import Fore, Style
@@ -24,6 +33,9 @@ from azure.identity import DefaultAzureCredential
 
 import PROMPT_MANAGEMENT
 import GUARDRAILS
+
+# In-memory cache to avoid re-running identical queries within a single session
+_QUERY_CACHE: Dict[tuple, Dict[str, Any]] = {}
 
 MAX_QUERY_ROWS = 2000          # cap rows returned from Log Analytics
 SUMMARY_TRIGGER_ROWS = 800     # if >=, we summarize for LLM
@@ -221,8 +233,21 @@ def _build_kql(*, table_name: str, fields: List[str], device_name: str, caller: 
     )
 
 
+def _looks_like_unknown_field_semantic_error(err_text: str) -> bool:
+    """
+    Detect the common Log Analytics failure when a projected column doesn't exist.
+    Example: "'project' operator: Failed to resolve scalar expression named 'AlertName'"
+    """
+    t = (err_text or "").lower()
+    if "failed to resolve scalar expression named" in t:
+        return True
+    if "semanticerror" in t and "project" in t and "failed to resolve" in t:
+        return True
+    return False
+
+
 # ----------------------------
-# Log Analytics query
+# Log Analytics query (with cache-hit polish + safe retry)
 # ----------------------------
 def query_log_analytics(
     *,
@@ -238,6 +263,10 @@ def query_log_analytics(
     """
     Executes safe, capped KQL and returns:
       { "count": int, "records": "csv text" }
+
+    Reliability:
+      - If Log Analytics errors due to unknown projected field names,
+        retry ONCE with no explicit field projection (project *).
     """
     cleaned_fields = GUARDRAILS.validate_tables_and_fields(
         table_name,
@@ -245,33 +274,74 @@ def query_log_analytics(
         strict=False,
     )
 
-    kql = _build_kql(
-        table_name=table_name,
-        fields=cleaned_fields,
-        device_name=device_name,
-        caller=caller,
-        user_principal_name=user_principal_name,
-        time_range_hours=int(timerange_hours),
-    )
+    def _run_once(project_fields: List[str]) -> Dict[str, Any]:
+        kql = _build_kql(
+            table_name=table_name,
+            fields=project_fields,
+            device_name=device_name,
+            caller=caller,
+            user_principal_name=user_principal_name,
+            time_range_hours=int(timerange_hours),
+        )
 
-    print(Fore.LIGHTGREEN_EX + "Constructed KQL Query:" + Style.RESET_ALL)
-    print(kql)
-    print(Fore.LIGHTGREEN_EX + f"Querying Log Analytics Workspace ID: '{workspace_id}'..." + Style.RESET_ALL)
+        # ✅ Cache identical queries within this session
+        cache_key = (workspace_id, kql)
+        if cache_key in _QUERY_CACHE:
+            cached = _QUERY_CACHE[cache_key]
+            print(
+                Fore.CYAN
+                + "✅ Cache hit — returning cached results (no new Log Analytics query)"
+                + Style.RESET_ALL
+            )
+            print(
+                Fore.WHITE
+                + f"   cached_count={cached.get('count', 0)} | table={table_name} | range={int(timerange_hours)}h | device={device_name or 'ALL'}\n"
+                + Style.RESET_ALL
+            )
+            return cached
 
-    timespan = timedelta(hours=int(timerange_hours))
-    response = log_analytics_client.query_workspace(
-        workspace_id=workspace_id,
-        query=kql,
-        timespan=timespan,
-    )
+        # Only print KQL when actually executing
+        print(Fore.LIGHTGREEN_EX + "Constructed KQL Query:" + Style.RESET_ALL)
+        print(kql)
+        print(Fore.LIGHTGREEN_EX + f"Querying Log Analytics Workspace ID: '{workspace_id}'..." + Style.RESET_ALL)
 
-    if not response or not getattr(response, "tables", None):
-        return {"count": 0, "records": ""}
+        timespan = timedelta(hours=int(timerange_hours))
+        response = log_analytics_client.query_workspace(
+            workspace_id=workspace_id,
+            query=kql,
+            timespan=timespan,
+        )
 
-    table = response.tables[0]
-    columns = [getattr(c, "name", c) for c in (table.columns or [])]
-    rows = table.rows or []
-    return {"count": len(rows), "records": _rows_to_csv(columns, rows)}
+        if not response or not getattr(response, "tables", None):
+            result = {"count": 0, "records": ""}
+            _QUERY_CACHE[cache_key] = result
+            return result
+
+        table = response.tables[0]
+        columns = [getattr(c, "name", c) for c in (table.columns or [])]
+        rows = table.rows or []
+
+        result = {"count": len(rows), "records": _rows_to_csv(columns, rows)}
+        _QUERY_CACHE[cache_key] = result
+        return result
+
+    # Attempt #1 (normal)
+    try:
+        return _run_once(cleaned_fields)
+    except Exception as e:
+        err_text = str(e)
+
+        # Attempt #2 (minimal fallback): if unknown field semantic error, retry with no explicit projection
+        if cleaned_fields and _looks_like_unknown_field_semantic_error(err_text):
+            print(
+                Fore.YELLOW
+                + "[i] Log Analytics rejected one or more projected fields. Retrying safely with project * ..."
+                + Style.RESET_ALL
+            )
+            return _run_once([])
+
+        # Otherwise, bubble up (so main prints/logs it)
+        raise
 
 
 def _rows_to_csv(columns: List[str], rows: List[list]) -> str:
@@ -309,7 +379,10 @@ def summarize_csv_for_llm(records_csv: str, *, top_n: int = 12, sample_rows: int
     header = lines[0].split(",")
     body = lines[1:]
 
-    interesting = [c for c in ["AccountName", "ActionType", "RemoteIP", "RemotePort", "FileName", "ProcessCommandLine", "DeviceName"] if c in header]
+    interesting = [
+        c for c in ["AccountName", "ActionType", "RemoteIP", "RemotePort", "FileName", "ProcessCommandLine", "DeviceName"]
+        if c in header
+    ]
     if not interesting:
         interesting = header[:5]
 

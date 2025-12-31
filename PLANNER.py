@@ -1,172 +1,114 @@
 # PLANNER.py
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 # Planner:
-# - Uses an LLM to propose 1–3 pivot steps (NO KQL from the model)
-# - Sanitizes the plan:
-#    ✅ clamps time_range_hours
-#    ✅ forces single-value anchors (device/user/caller)
-#    ✅ normalizes + prunes fields with GUARDRAILS (non-strict)
-# - Executes pivots via your query runner (EXECUTOR.query_log_analytics)
-# - Returns pivot evidence blocks for the hunt prompt
-#
-# Safety:
-# ✅ If using response_format json_object, ensure messages mention "json"
-# -------------------------------------------------------------------
+# - Ask LLM for 1-3 pivot steps (JSON only)
+# - Sanitize each step (table/fields/time range)
+# - Execute pivots via your query runner (EXECUTOR.query_log_analytics)
+# ------------------------------------------------------------
 
-# Standard library
 import json
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Any
 
-# Local modules
 import UTILITIES
 import GUARDRAILS
 
 
 def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _ensure_json_mention(messages: list) -> list:
-    joined = " ".join([(m.get("content") or "") for m in messages if isinstance(m, dict)])
-    if "json" in joined.lower():
-        return messages
-    return [{"role": "system", "content": "Return JSON only."}] + messages
+def _ensure_json_mention(messages: List[dict]) -> List[dict]:
+    out = []
+    for m in messages:
+        if m.get("role") == "system" and "json" not in (m.get("content") or "").lower():
+            m = dict(m)
+            m["content"] = (m.get("content") or "") + "\n\nOutput must be valid json."
+        out.append(m)
+    return out
 
 
-def _clamp_int(v, lo: int, hi: int, default: int) -> int:
+def _int_clamp(v: Any, min_v: int, max_v: int, default: int) -> int:
     try:
         n = int(v)
     except Exception:
         return default
-    return max(lo, min(hi, n))
+    return max(min_v, min(max_v, n))
 
 
-def _normalize_fields(fields) -> str:
-    if isinstance(fields, list):
-        fields = [str(x).strip() for x in fields if str(x).strip()]
-        return ", ".join(fields[:20])
-    parts = [p.strip() for p in str(fields).split(",") if p.strip()]
-    return ", ".join(parts[:20])
+def _sanitize_planned_step(step: dict, initial_query_context: dict) -> dict:
+    table_name = (step.get("table_name") or "").strip()
+    if not table_name:
+        raise ValueError("missing table_name")
+
+    device_name = (step.get("device_name") or initial_query_context.get("device_name") or "").strip()
+    user_principal_name = (step.get("user_principal_name") or initial_query_context.get("user_principal_name") or "").strip()
+    caller = (step.get("caller") or initial_query_context.get("caller") or "").strip()
+
+    time_range_hours = _int_clamp(step.get("time_range_hours"), 1, 168, int(initial_query_context.get("time_range_hours") or 96))
+
+    fields_raw = step.get("fields") or ""
+    if isinstance(fields_raw, str):
+        fields = [f.strip() for f in fields_raw.split(",") if f.strip()]
+    elif isinstance(fields_raw, list):
+        fields = [str(f).strip() for f in fields_raw if str(f).strip()]
+    else:
+        fields = []
+
+    cleaned_fields = GUARDRAILS.validate_tables_and_fields(table_name, fields, strict=False)
+
+    # 🔹 SOC VISIBILITY UPGRADE (still minimal)
+    if table_name == "DeviceNetworkEvents":
+        allowed = GUARDRAILS.ALLOWED_TABLES.get("DeviceNetworkEvents") or set()
+        if "RemoteIP" in allowed and "RemoteIP" not in cleaned_fields:
+            cleaned_fields.append("RemoteIP")
+        if "LocalIP" in allowed and "LocalIP" not in cleaned_fields:
+            cleaned_fields.append("LocalIP")
+
+    return {
+        "goal": (step.get("goal") or "").strip(),
+        "table_name": table_name,
+        "time_range_hours": time_range_hours,
+        "device_name": device_name,
+        "user_principal_name": user_principal_name,
+        "caller": caller,
+        "fields": cleaned_fields,
+    }
 
 
-def _single_value(v: str, *, max_len: int = 80) -> str:
-    if not v:
+def _summarize_csv(csv_text: str, max_lines: int = 18) -> str:
+    if not csv_text:
         return ""
-    s = str(v).strip().replace('"', "").replace("'", "")
-    if "," in s:
-        s = s.split(",")[0].strip()
-    s = re.sub(r"[|;`$<>]", "", s)
-    if len(s) > max_len:
-        s = s[:max_len]
-    return s
-
-
-def _same_scope_guard(initial_qc: dict, qc: dict) -> bool:
-    init_device = (initial_qc.get("device_name") or "").strip().lower()
-    init_upn = (initial_qc.get("user_principal_name") or "").strip().lower()
-    init_caller = (initial_qc.get("caller") or "").strip().lower()
-
-    device = (qc.get("device_name") or "").strip().lower()
-    upn = (qc.get("user_principal_name") or "").strip().lower()
-    caller = (qc.get("caller") or "").strip().lower()
-
-    anchors_present = any([init_device, init_upn, init_caller])
-    if not anchors_present:
-        return True
-
-    if init_device and device and device.startswith(init_device):
-        return True
-    if init_upn and upn and upn.startswith(init_upn):
-        return True
-    if init_caller and caller and caller.startswith(init_caller):
-        return True
-
-    return False
-
-
-def _sanitize_planned_step(step: dict, initial_qc: dict) -> dict:
-    qc = dict(step or {})
-
-    qc.setdefault("table_name", initial_qc.get("table_name", ""))
-    qc.setdefault("time_range_hours", initial_qc.get("time_range_hours", 24))
-    qc.setdefault("device_name", initial_qc.get("device_name", ""))
-    qc.setdefault("caller", initial_qc.get("caller", ""))
-    qc.setdefault("user_principal_name", initial_qc.get("user_principal_name", ""))
-    qc.setdefault("fields", initial_qc.get("fields", ""))
-
-    qc["time_range_hours"] = _clamp_int(
-        qc.get("time_range_hours"),
-        1,
-        168,
-        int(initial_qc.get("time_range_hours") or 24),
-    )
-
-    qc["fields"] = _normalize_fields(qc.get("fields"))
-
-    qc["device_name"] = _single_value(qc.get("device_name", ""))
-    qc["user_principal_name"] = _single_value(qc.get("user_principal_name", ""))
-    qc["caller"] = _single_value(qc.get("caller", ""))
-
-    # ✅ normalize + prune invalid fields (NON-STRICT)
-    cleaned_fields = GUARDRAILS.validate_tables_and_fields(
-        qc.get("table_name", ""),
-        qc.get("fields", ""),
-        strict=False,
-    )
-    qc["fields"] = ", ".join(cleaned_fields)
-
-    if not _same_scope_guard(initial_qc, qc):
-        qc["device_name"] = initial_qc.get("device_name", "")
-        qc["caller"] = initial_qc.get("caller", "")
-        qc["user_principal_name"] = initial_qc.get("user_principal_name", "")
-
-    qc["goal"] = (qc.get("goal") or "").strip()[:220]
-    return qc
-
-
-def _summarize_csv(records_csv: str, max_lines: int = 20) -> str:
-    if not records_csv:
-        return ""
-    lines = records_csv.splitlines()
+    lines = csv_text.splitlines()
     if not lines:
         return ""
-    head = lines[:max_lines]
-    snippet = "\n".join(head)
-    if len(lines) > max_lines:
-        snippet += f"\n... ({len(lines)-max_lines} more lines omitted)"
-    return snippet
+    head = lines[: max_lines + 1]
+    out = "\n".join(head)
+    if len(lines) > len(head):
+        out += f"\n... ({len(lines) - len(head)} more lines omitted)"
+    return out
 
 
-def _format_pivot_block(step_idx: int, qc: dict, record_count: int, preview: str) -> str:
-    goal = qc.get("goal") or f"Pivot step {step_idx}"
-    table_name = qc.get("table_name")
-    tr = qc.get("time_range_hours")
-    device = qc.get("device_name")
-    upn = qc.get("user_principal_name")
-    caller = qc.get("caller")
-
-    scope_parts = []
-    if device:
-        scope_parts.append(f"device={device}")
-    if upn:
-        scope_parts.append(f"user={upn}")
-    if caller:
-        scope_parts.append(f"caller={caller}")
-    scope = ", ".join(scope_parts) if scope_parts else "scope=global"
-
+def _format_pivot_block(idx: int, step: dict, count: int, preview: str) -> str:
     return (
-        f"\n[Planner Pivot #{step_idx}] {goal}\n"
-        f"- table: {table_name}\n"
-        f"- time_range_hours: {tr}\n"
-        f"- {scope}\n"
-        f"- record_count: {record_count}\n"
+        f"\n[Planner Pivot #{idx}] {step.get('goal')}\n"
+        f"- table: {step.get('table_name')}\n"
+        f"- time_range_hours: {step.get('time_range_hours')}\n"
+        f"- device={step.get('device_name')}, caller={step.get('caller')}\n"
+        f"- record_count: {count}\n"
         f"- preview:\n{preview}\n"
     )
 
 
-def build_plan(openai_client, *, model: str, user_prompt: str, initial_query_context: dict, baseline_note: str = "") -> List[dict]:
+def build_plan(
+    openai_client,
+    *,
+    model: str,
+    user_prompt: str,
+    initial_query_context: dict,
+    baseline_note: str = ""
+) -> List[dict]:
     system = {
         "role": "system",
         "content": (
@@ -242,6 +184,25 @@ def build_plan(openai_client, *, model: str, user_prompt: str, initial_query_con
     return cleaned
 
 
+def _dedupe_planner_steps(steps: List[dict]) -> List[dict]:
+    seen = set()
+    out: List[dict] = []
+    for s in steps or []:
+        sig = (
+            str(s.get("table_name") or ""),
+            int(s.get("time_range_hours") or 0),
+            str(s.get("device_name") or ""),
+            str(s.get("user_principal_name") or ""),
+            str(s.get("caller") or ""),
+            ",".join(list(s.get("fields") or [])) if isinstance(s.get("fields"), list) else str(s.get("fields") or ""),
+        )
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(s)
+    return out
+
+
 def run_planner_pivots(
     *,
     openai_client,
@@ -263,6 +224,7 @@ def run_planner_pivots(
         baseline_note=baseline_note,
     )
 
+    steps = _dedupe_planner_steps(steps)
     UTILITIES.log_event("planner_plan", {"steps": steps})
 
     pivot_blocks = ""
@@ -275,10 +237,10 @@ def run_planner_pivots(
                 workspace_id=log_workspace_id,
                 timerange_hours=step_qc["time_range_hours"],
                 table_name=step_qc["table_name"],
-                device_name=step_qc.get("device_name", ""),
-                fields=step_qc.get("fields", ""),
-                caller=step_qc.get("caller", ""),
-                user_principal_name=step_qc.get("user_principal_name", ""),
+                device_name=step_qc["device_name"],
+                fields=step_qc["fields"],
+                caller=step_qc["caller"],
+                user_principal_name=step_qc["user_principal_name"],
             )
 
             count = int(res.get("count") or 0)
