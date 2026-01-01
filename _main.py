@@ -15,13 +15,13 @@
 #    ✅ Ensures DeviceName is included for global Device* hunts so we can attribute a device
 # 9) If isolated in this session: allow release via command
 #
-# IMPORTANT FIXES IN THIS VERSION
-# - Uses EXECUTOR.isolate_vm_by_name() and EXECUTOR.release_vm_by_name()
-#   ✅ Fixes: "module 'EXECUTOR' has no attribute 'get_bearer_token'"
-#   ✅ Fixes: MDE 400 filter bug by relying on EXECUTOR's corrected lookup
-# - Adds DeviceName to fields automatically for global Device* hunts (so isolation prompt triggers reliably)
-# - Adds a hard "model capacity" check to avoid token limit issues:
-#   - If selected model can't fit, falls back to larger-context model and/or shrinks log payload further.
+# NEW IN THIS VERSION
+# ✅ Adds an "Executive Summary" block after every hunt (portfolio / screenshot-ready)
+#   - Targets, time window, tables queried
+#   - Top anomalies (baseline + pivots)
+#   - Killchain + escalation
+#   - Top findings + confidence
+#   - Isolation status (NOW prints AFTER isolation decision)
 # -------------------------------------------------------------------
 
 # Standard library
@@ -29,6 +29,7 @@ import os
 import time
 import csv
 import io
+import re
 from collections import Counter
 from typing import Dict, Any, List, Optional
 
@@ -211,15 +212,11 @@ def _choose_device_from_list(devices: List[str]) -> Optional[str]:
 # Token/model safety helpers
 # ----------------------------
 def _get_model_max_input(model_name: str) -> int:
-    # Uses your GUARDRAILS model allowlist as the source of truth.
     meta = GUARDRAILS.ALLOWED_MODELS.get(model_name) or {}
     return int(meta.get("max_input_tokens") or 0)
 
 
 def _shrink_log_payload(log_payload: str, *, max_lines: int, max_chars: int) -> str:
-    """
-    Extra clamp beyond PROMPT_MANAGEMENT.clamp_log_payload (for worst-case prompts).
-    """
     if not log_payload:
         return ""
 
@@ -234,12 +231,6 @@ def _shrink_log_payload(log_payload: str, *, max_lines: int, max_chars: int) -> 
 
 
 def _select_model_safely(*, messages: List[dict], record_count: int, model_default: str) -> str:
-    """
-    Pick a model based on estimated tokens, but NEVER exceed the model's max input.
-    If too large:
-      - prefer a larger-context model (gpt-4.1 has the largest in your allowlist)
-      - otherwise rely on caller to shrink payload more
-    """
     est = MODEL_MANAGEMENT.count_tokens(messages, model_default)
 
     candidate = MODEL_MANAGEMENT.auto_select_model(
@@ -251,13 +242,133 @@ def _select_model_safely(*, messages: List[dict], record_count: int, model_defau
 
     max_in = _get_model_max_input(candidate)
     if max_in and est > max_in:
-        # Fallback to largest-context model in your allowlist.
-        # (In your GUARDRAILS, gpt-4.1 has the biggest max_input_tokens.)
         fallback = "gpt-4.1"
         fallback = MODEL_MANAGEMENT.ensure_model_ok(fallback)
         return fallback
 
     return candidate
+
+
+# ----------------------------
+# Executive Summary (analyst-grade output)
+# ----------------------------
+def _extract_top_baseline_anomalies(baseline_note: str, *, max_items: int = 3) -> List[str]:
+    """
+    baseline_note is your BASELINES.anomaly_summary text.
+    We pull the first N bullet-like anomaly lines if present.
+    """
+    if not baseline_note:
+        return []
+
+    lines = [ln.strip() for ln in baseline_note.splitlines() if ln.strip()]
+    hits = [ln for ln in lines if ln.startswith("- ")]
+    if not hits:
+        hits = [ln for ln in lines if (" | run=" in ln) or ("Rare / unusual" in ln)]
+
+    out = []
+    for h in hits:
+        out.append(h[2:] if h.startswith("- ") else h)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _summarize_pivots(steps: List[dict]) -> str:
+    if not steps:
+        return ""
+    parts = []
+    for s in steps[:3]:
+        t = (s.get("table_name") or "").strip()
+        g = (s.get("goal") or "").strip()
+        if t and g:
+            parts.append(f"{t} — {g}")
+        elif t:
+            parts.append(t)
+    return "; ".join(parts)
+
+
+def _print_executive_summary(
+    *,
+    query_context: dict,
+    record_count_initial: int,
+    baseline_note: str,
+    planner_steps: List[dict],
+    killchain_report: Dict[str, Any],
+    escalation: Dict[str, Any],
+    findings: List[dict],
+    isolation_performed: bool,
+    isolated_device_name: Optional[str],
+) -> None:
+    target = (query_context.get("device_name") or "").strip() or "[global]"
+    hours = int(query_context.get("time_range_hours") or 0)
+    primary_table = (query_context.get("table_name") or "").strip()
+
+    tables = [primary_table] if primary_table else []
+    for s in planner_steps or []:
+        t = (s.get("table_name") or "").strip()
+        if t and t not in tables:
+            tables.append(t)
+
+    top_anoms = _extract_top_baseline_anomalies(baseline_note, max_items=3)
+
+    def _conf_rank(c: str) -> int:
+        c = (c or "").strip().lower()
+        return {"high": 0, "medium": 1, "low": 2}.get(c, 3)
+
+    top_findings = sorted(findings or [], key=lambda x: _conf_rank(x.get("confidence")))[:3]
+
+    observed = ", ".join(killchain_report.get("observed_stages") or []) if killchain_report else ""
+    kscore = killchain_report.get("score") if killchain_report else None
+
+    esc_action = escalation.get("action") if escalation else None
+    esc_score = escalation.get("score") if escalation else None
+
+    iso_line = "Not performed"
+    if isolation_performed and isolated_device_name:
+        iso_line = f"Performed (device={isolated_device_name})"
+
+    print(Fore.LIGHTWHITE_EX + "\n" + "─" * 52 + Style.RESET_ALL)
+    print(Fore.LIGHTWHITE_EX + "EXECUTIVE SUMMARY" + Style.RESET_ALL)
+    print(Fore.LIGHTWHITE_EX + "─" * 52 + Style.RESET_ALL)
+
+    print(Fore.WHITE + f"Target(s):            {Fore.CYAN}{target}{Style.RESET_ALL}")
+    print(Fore.WHITE + f"Time Window:          Last {hours} hours" + Style.RESET_ALL)
+    print(Fore.WHITE + f"Tables Queried:       {', '.join(tables) if tables else '[unknown]'}" + Style.RESET_ALL)
+    print(Fore.WHITE + f"Records (initial):    {record_count_initial}" + Style.RESET_ALL)
+
+    if planner_steps:
+        piv = _summarize_pivots(planner_steps)
+        if piv:
+            print(Fore.WHITE + f"Pivot Summary:        {piv}" + Style.RESET_ALL)
+
+    if top_anoms:
+        print(Fore.WHITE + "\nTop Anomalies:" + Style.RESET_ALL)
+        for i, a in enumerate(top_anoms, 1):
+            print(Fore.WHITE + f"  {i}) {a}" + Style.RESET_ALL)
+
+    if top_findings:
+        print(Fore.WHITE + "\nTop Findings:" + Style.RESET_ALL)
+        for i, f in enumerate(top_findings, 1):
+            title = (f.get("title") or "Finding").strip()
+            conf = (f.get("confidence") or "Unknown").strip()
+            print(Fore.WHITE + f"  {i}) {title}  [{conf.upper()}]" + Style.RESET_ALL)
+
+    if observed or (kscore is not None):
+        print(Fore.WHITE + "\nKill Chain:" + Style.RESET_ALL)
+        if observed:
+            print(Fore.WHITE + f"  Observed Stages:    {observed}" + Style.RESET_ALL)
+        if kscore is not None:
+            print(Fore.WHITE + f"  Progression Score:  {kscore}/100" + Style.RESET_ALL)
+
+    if esc_action or (esc_score is not None):
+        print(Fore.WHITE + "\nEscalation:" + Style.RESET_ALL)
+        if esc_action:
+            print(Fore.WHITE + f"  Action:             {esc_action}" + Style.RESET_ALL)
+        if esc_score is not None:
+            print(Fore.WHITE + f"  Score:              {esc_score}" + Style.RESET_ALL)
+
+    print(Fore.WHITE + "\nIsolation Status:     " + Fore.YELLOW + iso_line + Style.RESET_ALL)
+    print(Fore.LIGHTWHITE_EX + "─" * 52 + Style.RESET_ALL + "\n")
 
 
 # ----------------------------
@@ -317,8 +428,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
     )
     query_context["fields"] = cleaned_fields
 
-    # ✅ IMPORTANT: If the hunt is GLOBAL (no device filter) and table is Device*,
-    # ensure DeviceName is included so we can attribute a device for isolation prompt.
+    # If global Device* hunt, ensure DeviceName is included
     device_filter = (query_context.get("device_name") or "").strip()
     if not device_filter and str(query_context.get("table_name", "")).startswith("Device"):
         if "DeviceName" not in query_context["fields"]:
@@ -392,6 +502,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
         UTILITIES.log_event("baseline_error", {"error": str(e)})
 
     # Planner pivots
+    planner_steps: List[dict] = []
     try:
         plan_out = PLANNER.run_planner_pivots(
             openai_client=openai_client,
@@ -404,6 +515,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
             log_client=law_client,
         )
 
+        planner_steps = plan_out.get("steps") or []
         pivot_blocks = plan_out.get("pivot_blocks") or ""
         if pivot_blocks:
             print(Fore.LIGHTMAGENTA_EX + "\n🧠 Planner Pivot Evidence:" + Style.RESET_ALL)
@@ -411,6 +523,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
     except Exception as e:
         UTILITIES.log_event("planner_fatal", {"error": str(e)})
         pivot_blocks = ""
+        planner_steps = []
 
     # Killchain
     killchain_report: Dict[str, Any] = {}
@@ -447,7 +560,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
 
     print(Fore.LIGHTGREEN_EX + "Building threat hunt prompt/instructions...\n" + Style.RESET_ALL)
 
-    # First-pass token-safe payload (your executor clamps/summarizes)
+    # First-pass token-safe payload
     safe_log_payload = EXECUTOR.prepare_log_data_for_llm(records_csv, number_of_records)
 
     threat_hunt_user_message = PROMPT_MANAGEMENT.build_threat_hunt_prompt(
@@ -459,25 +572,19 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
     threat_hunt_system_message = PROMPT_MANAGEMENT.SYSTEM_PROMPT_THREAT_HUNT
     threat_hunt_messages = [threat_hunt_system_message, threat_hunt_user_message]
 
-    # ✅ Model selection with hard max-input safety
+    # Model selection with hard max-input safety
     model = _select_model_safely(
         messages=threat_hunt_messages,
         record_count=number_of_records,
         model_default=model_default,
     )
 
-    # ✅ If STILL too big for the selected model, shrink further and rebuild messages.
-    # (This is the “never exceed max tokens” guardrail.)
+    # If still too big, shrink further
     for attempt in range(4):
         est_tokens = MODEL_MANAGEMENT.count_tokens(threat_hunt_messages, model_default)
         max_in = _get_model_max_input(model)
 
         if max_in and est_tokens > max_in:
-            # shrink log payload progressively
-            # attempt 0: 800 lines / 120k chars
-            # attempt 1: 400 lines / 80k chars
-            # attempt 2: 200 lines / 50k chars
-            # attempt 3: 120 lines / 30k chars
             shrink_profiles = [
                 (800, 120_000),
                 (400, 80_000),
@@ -494,7 +601,6 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
             )
             threat_hunt_messages = [threat_hunt_system_message, threat_hunt_user_message]
 
-            # pick again (may move to gpt-4.1 if needed)
             model = _select_model_safely(
                 messages=threat_hunt_messages,
                 record_count=number_of_records,
@@ -550,7 +656,7 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
     UTILITIES.display_threats(threat_list=findings)
 
     # ----------------------------
-    # Ask-first isolation (works for device-scoped OR global hunts)
+    # Ask-first isolation
     # ----------------------------
     high_findings = [t for t in findings if (t.get("confidence") or "").strip().lower() == "high"]
     if high_findings and (not machine_state.get("machine_is_isolated")):
@@ -558,19 +664,15 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
         title = top.get("title") or "High confidence threat"
         reason = f"{title} (confidence=high)"
 
-        # 1) If tool selection gave a device, use it
         device_name = (query_context.get("device_name") or "").strip()
 
-        # 2) If no device filter, infer from CSV using DeviceName column
         if not device_name:
             candidates = _top_devices_from_csv(records_csv, top_n=5)
             device_name = _choose_device_from_list(candidates) or ""
 
-        # If still no device, do not prompt isolate
         if device_name:
             if _ask_to_isolate(device_name=device_name, reason=reason):
                 try:
-                    # ✅ FIX: use the new executor isolation helpers
                     result = EXECUTOR.isolate_vm_by_name(
                         device_name,
                         comment="Isolation via Agentic SOC Analyst (user-approved)",
@@ -596,6 +698,19 @@ def _run_single_iteration(*, model_default: str, machine_state: dict) -> str:
                 + "[i] High finding detected, but no device could be attributed from the results. Skipping isolation prompt."
                 + Style.RESET_ALL
             )
+
+    # ✅ Executive Summary NOW prints AFTER isolation decision
+    _print_executive_summary(
+        query_context=query_context,
+        record_count_initial=number_of_records,
+        baseline_note=baseline_note,
+        planner_steps=planner_steps,
+        killchain_report=killchain_report,
+        escalation=escalation,
+        findings=findings,
+        isolation_performed=bool(machine_state.get("machine_is_isolated")),
+        isolated_device_name=machine_state.get("isolated_device_name"),
+    )
 
     return "continue"
 
@@ -659,4 +774,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
