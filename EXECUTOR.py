@@ -1,477 +1,208 @@
 # EXECUTOR.py
 # -------------------------------------------------------------------
-# Executor:
-# - Tool selection: get_query_context() via OpenAI function calling
-# - Query Log Analytics: query_log_analytics() builds SAFE KQL
-# - Token-safe payload for LLM
-# - Hunt: calls model with response_format json_object safely
-# - MDE Isolation helpers:
-#     ✅ get_bearer_token()
-#     ✅ get_mde_workstation_id_from_name() using computerDnsName (fixes HTTP 400 deviceName error)
-#     ✅ isolate_vm_by_name()
-#     ✅ release_vm_by_name()
+# Query execution utilities for Log Analytics + safe parsing helpers
 #
-# Minimal enterprise polish added:
-#   ✅ In-memory query cache per session
-#   ✅ Cache-hit message instead of re-printing/re-running identical KQL
+# ✅ Backward compatible:
+#   - accepts law_client or log_analytics_client
+#   - accepts kql_query or kql
+#   - accepts timespan_hours or timerange_hours
+#   - accepts hours (alias)
 #
-# NEW (minimal, high-value reliability fix):
-#   ✅ Auto-retry once WITHOUT projected fields if Log Analytics errors on unknown columns
-#      (e.g., AlertInfo AlertName, DeviceRegistryEvents RegistryPath)
+# ✅ Robust column parsing:
+#   Azure tables sometimes return columns as:
+#     - objects with .name
+#     - strings
+#     - dict-like shapes
 # -------------------------------------------------------------------
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Any, Dict, List, Optional
 
 import csv
 import io
-import json
-import re
-from datetime import timedelta
-from typing import Dict, Any, List
 
-import requests
-from colorama import Fore, Style
-from azure.identity import DefaultAzureCredential
+from azure.monitor.query import LogsQueryClient
+from azure.monitor.query import LogsQueryStatus
 
-import PROMPT_MANAGEMENT
-import GUARDRAILS
 
-# In-memory cache to avoid re-running identical queries within a single session
-_QUERY_CACHE: Dict[tuple, Dict[str, Any]] = {}
-
-MAX_QUERY_ROWS = 2000          # cap rows returned from Log Analytics
-SUMMARY_TRIGGER_ROWS = 800     # if >=, we summarize for LLM
-MAX_LLM_ROWS = 200             # if raw CSV is used, clamp to this
-MAX_LLM_CHARS = 120_000        # last-resort clamp
-MAX_LLM_LINES = 1200           # last-resort clamp
-
-
-# ----------------------------
-# MDE Isolation Helpers
-# ----------------------------
-MDE_BASE_URL = "https://api.securitycenter.microsoft.com/api"
-
-
-def get_bearer_token():
-    """
-    Get an Azure AD token scoped for Microsoft Defender for Endpoint API.
-    """
-    credential = DefaultAzureCredential()
-    token = credential.get_token("https://api.securitycenter.microsoft.com/.default")
-    return token
-
-
-def get_mde_workstation_id_from_name(token, device_name: str) -> str:
-    """
-    Look up Defender for Endpoint machine ID by device name.
-    Uses computerDnsName (supported) and avoids unsupported 'deviceName' filter.
-    """
-    dn = (device_name or "").strip()
-    if not dn:
-        raise ValueError("device_name is empty")
-
-    headers = {"Authorization": f"Bearer {token.token}"}
-    base = f"{MDE_BASE_URL}/machines"
-
-    # Attempt 1: startswith computerDnsName (works for short hostname + FQDN)
-    params = {"$filter": f"startswith(computerDnsName,'{dn}')"}
-    r = requests.get(base, headers=headers, params=params, timeout=30)
-
-    if r.status_code != 200:
-        raise RuntimeError(f"MDE machine lookup failed: HTTP {r.status_code} {r.text}")
-
-    data = r.json() or {}
-    values = data.get("value") or []
-
-    # Attempt 2: contains computerDnsName (looser fallback)
-    if not values:
-        params2 = {"$filter": f"contains(computerDnsName,'{dn}')"}
-        r2 = requests.get(base, headers=headers, params=params2, timeout=30)
-
-        if r2.status_code != 200:
-            raise RuntimeError(f"MDE machine lookup failed: HTTP {r2.status_code} {r2.text}")
-
-        data2 = r2.json() or {}
-        values = data2.get("value") or []
-
-    if not values:
-        raise RuntimeError(f"No MDE machine matches found for '{dn}'")
-
-    machine_id = values[0].get("id")
-    if not machine_id:
-        raise RuntimeError("MDE machine match returned no 'id' field")
-
-    return machine_id
-
-
-def isolate_vm_by_name(device_name: str, *, comment: str = "Isolation requested by Agentic SOC Analyst") -> Dict[str, Any]:
-    """
-    Isolate a machine in Microsoft Defender for Endpoint by device name.
-    """
-    token = get_bearer_token()
-    machine_id = get_mde_workstation_id_from_name(token, device_name)
-
-    headers = {
-        "Authorization": f"Bearer {token.token}",
-        "Content-Type": "application/json",
-    }
-
-    url = f"{MDE_BASE_URL}/machines/{machine_id}/isolate"
-    payload = {"Comment": comment, "IsolationType": "Full"}  # "Full" is standard
-
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201, 202):
-        raise RuntimeError(f"MDE isolate failed: HTTP {r.status_code} {r.text}")
-
-    return r.json() if r.text else {"status": "submitted", "machine_id": machine_id}
-
-
-def release_vm_by_name(device_name: str, *, comment: str = "Release requested by Agentic SOC Analyst") -> Dict[str, Any]:
-    """
-    Release (unisolate) a machine in Microsoft Defender for Endpoint by device name.
-    """
-    token = get_bearer_token()
-    machine_id = get_mde_workstation_id_from_name(token, device_name)
-
-    headers = {
-        "Authorization": f"Bearer {token.token}",
-        "Content-Type": "application/json",
-    }
-
-    url = f"{MDE_BASE_URL}/machines/{machine_id}/unisolate"
-    payload = {"Comment": comment}
-
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code not in (200, 201, 202):
-        raise RuntimeError(f"MDE unisolate failed: HTTP {r.status_code} {r.text}")
-
-    return r.json() if r.text else {"status": "submitted", "machine_id": machine_id}
-
-
-# ----------------------------
-# Tool selection
-# ----------------------------
-def get_query_context(openai_client, user_message: dict, model: str) -> Dict[str, Any]:
-    """
-    Uses function calling to decide table/fields/time range. Returns dict of tool args.
-    """
-    print(Fore.LIGHTGREEN_EX + "Deciding log search parameters based on user request...\n" + Style.RESET_ALL)
-
-    resp = openai_client.chat.completions.create(
-        model=model,
-        messages=[PROMPT_MANAGEMENT.SYSTEM_PROMPT_TOOL_SELECTION, user_message],
-        tools=PROMPT_MANAGEMENT.TOOLS,
-        tool_choice="auto",
-    )
-
-    choice = resp.choices[0].message
-    tool_calls = getattr(choice, "tool_calls", None) or []
-    if not tool_calls:
-        raise RuntimeError("Tool selection returned no tool call.")
-
-    call = tool_calls[0]
-    args = json.loads(call.function.arguments)
-
-    cleaned_fields = GUARDRAILS.validate_tables_and_fields(
-        args["table_name"],
-        args.get("fields", []),
-        strict=False,
-    )
-    args["fields"] = cleaned_fields  # keep as list
-    return args
-
-
-# ----------------------------
-# KQL builder
-# ----------------------------
-def _kql_time_filter(hours: int) -> str:
-    return f"TimeGenerated >= ago({int(hours)}h)"
-
-
-def _escape_kql_string(s: str) -> str:
-    return (s or "").replace('"', '\\"')
-
-
-def _has_device_field(table_name: str) -> bool:
-    allowed = GUARDRAILS.ALLOWED_TABLES.get(table_name)
-    if allowed is None:
-        return False
-    return "DeviceName" in allowed
-
-
-def _build_filters(*, table_name: str, device_name: str, caller: str, user_principal_name: str, time_range_hours: int) -> str:
-    parts = [_kql_time_filter(time_range_hours)]
-
-    dn = (device_name or "").strip()
-    if dn:
-        if table_name.startswith("Device") or _has_device_field(table_name):
-            parts.append(f'DeviceName startswith "{_escape_kql_string(dn)}"')
-
-    if (caller or "").strip() and table_name == "AzureActivity":
-        parts.append(f'Caller has "{_escape_kql_string(caller.strip())}"')
-
-    if (user_principal_name or "").strip() and table_name == "SigninLogs":
-        parts.append(f'UserPrincipalName has "{_escape_kql_string(user_principal_name.strip())}"')
-
-    return " and ".join(parts)
-
-
-def _build_kql(*, table_name: str, fields: List[str], device_name: str, caller: str, user_principal_name: str, time_range_hours: int) -> str:
-    filters = _build_filters(
-        table_name=table_name,
-        device_name=device_name,
-        caller=caller,
-        user_principal_name=user_principal_name,
-        time_range_hours=int(time_range_hours),
-    )
-
-    project = ", ".join(fields) if fields else "*"
-
-    return (
-        f"{table_name}\n"
-        f"| where {filters}\n"
-        f"| project {project}\n"
-        f"| take {MAX_QUERY_ROWS}\n"
-    )
-
-
-def _looks_like_unknown_field_semantic_error(err_text: str) -> bool:
-    """
-    Detect the common Log Analytics failure when a projected column doesn't exist.
-    Example: "'project' operator: Failed to resolve scalar expression named 'AlertName'"
-    """
-    t = (err_text or "").lower()
-    if "failed to resolve scalar expression named" in t:
-        return True
-    if "semanticerror" in t and "project" in t and "failed to resolve" in t:
-        return True
-    return False
-
-
-# ----------------------------
-# Log Analytics query (with cache-hit polish + safe retry)
-# ----------------------------
-def query_log_analytics(
-    *,
-    log_analytics_client,
-    workspace_id: str,
-    timerange_hours: int,
-    table_name: str,
-    device_name: str,
-    fields,
-    caller: str,
-    user_principal_name: str,
-) -> Dict[str, Any]:
-    """
-    Executes safe, capped KQL and returns:
-      { "count": int, "records": "csv text" }
-
-    Reliability:
-      - If Log Analytics errors due to unknown projected field names,
-        retry ONCE with no explicit field projection (project *).
-    """
-    cleaned_fields = GUARDRAILS.validate_tables_and_fields(
-        table_name,
-        fields,
-        strict=False,
-    )
-
-    def _run_once(project_fields: List[str]) -> Dict[str, Any]:
-        kql = _build_kql(
-            table_name=table_name,
-            fields=project_fields,
-            device_name=device_name,
-            caller=caller,
-            user_principal_name=user_principal_name,
-            time_range_hours=int(timerange_hours),
-        )
-
-        # ✅ Cache identical queries within this session
-        cache_key = (workspace_id, kql)
-        if cache_key in _QUERY_CACHE:
-            cached = _QUERY_CACHE[cache_key]
-            print(
-                Fore.CYAN
-                + "✅ Cache hit — returning cached results (no new Log Analytics query)"
-                + Style.RESET_ALL
-            )
-            print(
-                Fore.WHITE
-                + f"   cached_count={cached.get('count', 0)} | table={table_name} | range={int(timerange_hours)}h | device={device_name or 'ALL'}\n"
-                + Style.RESET_ALL
-            )
-            return cached
-
-        # Only print KQL when actually executing
-        print(Fore.LIGHTGREEN_EX + "Constructed KQL Query:" + Style.RESET_ALL)
-        print(kql)
-        print(Fore.LIGHTGREEN_EX + f"Querying Log Analytics Workspace ID: '{workspace_id}'..." + Style.RESET_ALL)
-
-        timespan = timedelta(hours=int(timerange_hours))
-        response = log_analytics_client.query_workspace(
-            workspace_id=workspace_id,
-            query=kql,
-            timespan=timespan,
-        )
-
-        if not response or not getattr(response, "tables", None):
-            result = {"count": 0, "records": ""}
-            _QUERY_CACHE[cache_key] = result
-            return result
-
-        table = response.tables[0]
-        columns = [getattr(c, "name", c) for c in (table.columns or [])]
-        rows = table.rows or []
-
-        result = {"count": len(rows), "records": _rows_to_csv(columns, rows)}
-        _QUERY_CACHE[cache_key] = result
-        return result
-
-    # Attempt #1 (normal)
+def _safe_int(v: Any, default: int = 0) -> int:
     try:
-        return _run_once(cleaned_fields)
-    except Exception as e:
-        err_text = str(e)
-
-        # Attempt #2 (minimal fallback): if unknown field semantic error, retry with no explicit projection
-        if cleaned_fields and _looks_like_unknown_field_semantic_error(err_text):
-            print(
-                Fore.YELLOW
-                + "[i] Log Analytics rejected one or more projected fields. Retrying safely with project * ..."
-                + Style.RESET_ALL
-            )
-            return _run_once([])
-
-        # Otherwise, bubble up (so main prints/logs it)
-        raise
+        return int(v)
+    except Exception:
+        return default
 
 
-def _rows_to_csv(columns: List[str], rows: List[list]) -> str:
-    out = io.StringIO()
-    writer = csv.writer(out)
-    writer.writerow(columns)
+def _col_name(c: Any) -> str:
+    """
+    Azure table columns may be:
+      - object with .name
+      - plain string
+      - dict-like
+    """
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    # Column-like object
+    if hasattr(c, "name"):
+        try:
+            return str(getattr(c, "name"))
+        except Exception:
+            pass
+    # Dict-like fallback
+    if isinstance(c, dict) and "name" in c:
+        return str(c.get("name"))
+    # Last resort
+    return str(c)
+
+
+def _table_to_records(table: Any) -> List[Dict[str, Any]]:
+    """
+    Convert Azure LogsQueryResult table -> list[dict]
+    """
+    if table is None:
+        return []
+
+    raw_cols = getattr(table, "columns", None) or []
+    cols = [_col_name(c) for c in raw_cols]
+
+    rows = getattr(table, "rows", None) or []
+
+    out: List[Dict[str, Any]] = []
     for r in rows:
-        writer.writerow(r)
-    return out.getvalue()
+        d: Dict[str, Any] = {}
+        for i, col in enumerate(cols):
+            d[col] = r[i] if i < len(r) else None
+        out.append(d)
+    return out
 
 
-# ----------------------------
-# Token-safe payload for LLM
-# ----------------------------
-def _hard_clamp_text(text: str, *, max_chars: int = MAX_LLM_CHARS, max_lines: int = MAX_LLM_LINES) -> str:
-    if not text:
-        return ""
-    lines = text.splitlines()
-    if len(lines) > max_lines:
-        lines = lines[:max_lines] + [f"... (clamped: {len(lines)-max_lines} lines omitted)"]
-    clamped = "\n".join(lines)
-    if len(clamped) > max_chars:
-        clamped = clamped[:max_chars] + "\n... (clamped by char limit)"
-    return clamped
-
-
-def summarize_csv_for_llm(records_csv: str, *, top_n: int = 12, sample_rows: int = 200) -> str:
-    if not records_csv:
-        return ""
-
-    lines = records_csv.splitlines()
-    if len(lines) <= 1:
-        return records_csv
-
-    header = lines[0].split(",")
-    body = lines[1:]
-
-    interesting = [
-        c for c in ["AccountName", "ActionType", "RemoteIP", "RemotePort", "FileName", "ProcessCommandLine", "DeviceName"]
-        if c in header
-    ]
-    if not interesting:
-        interesting = header[:5]
-
-    idx = {name: header.index(name) for name in interesting}
-    counts = {name: {} for name in interesting}
-
-    for row in body[:5000]:
-        parts = row.split(",")
-        for k, i in idx.items():
-            val = parts[i] if i < len(parts) else ""
-            if val == "":
-                val = "<blank>"
-            counts[k][val] = counts[k].get(val, 0) + 1
-
-    summary = [
-        "[SAFE_LOG_SUMMARY json]",
-        f"- rows_total: {len(body)}",
-        f"- sample_rows_used: {min(len(body), 5000)}",
-        "",
-        "Top values by field:"
-    ]
-    for field in interesting:
-        summary.append(f"\n- {field}:")
-        top = sorted(counts[field].items(), key=lambda x: x[1], reverse=True)[:top_n]
-        for v, c in top:
-            summary.append(f"  - {v}: {c}")
-
-    summary.append("\nRaw sample rows (first few):")
-    summary.append(lines[0])
-    summary.extend(body[:sample_rows])
-    return _hard_clamp_text("\n".join(summary))
-
-
-def build_token_safe_log_payload(*, records_csv: str, record_count: int) -> str:
-    if not records_csv:
-        return ""
-    if record_count >= SUMMARY_TRIGGER_ROWS:
-        return summarize_csv_for_llm(records_csv)
-
-    lines = records_csv.splitlines()
-    if len(lines) <= 1:
-        return records_csv
-
-    header = lines[0]
-    body = lines[1:][:MAX_LLM_ROWS]
-    trimmed = "\n".join([header] + body)
-    return _hard_clamp_text(trimmed)
-
-
-def prepare_log_data_for_llm(records_csv: str, record_count: int) -> str:
+def records_to_csv(records: List[Dict[str, Any]]) -> str:
     """
-    Compatibility wrapper: supports positional calls from older code.
+    list[dict] -> csv text (header + rows)
     """
-    return build_token_safe_log_payload(records_csv=records_csv, record_count=record_count)
+    if not records:
+        return ""
+
+    # union of keys (stable order: keys from first row, then others)
+    fieldnames = list(records[0].keys())
+    seen = set(fieldnames)
+    for r in records[1:]:
+        for k in r.keys():
+            if k not in seen:
+                fieldnames.append(k)
+                seen.add(k)
+
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fieldnames)
+    w.writeheader()
+    for r in records:
+        w.writerow({k: r.get(k) for k in fieldnames})
+    return buf.getvalue()
 
 
-# ----------------------------
-# LLM Hunt
-# ----------------------------
-def hunt(
+def run_kql_query(
     *,
-    openai_client,
-    threat_hunt_system_message: dict,
-    threat_hunt_user_message: dict,
-    openai_model: str,
+    law_client: Optional[LogsQueryClient] = None,
+    log_analytics_client: Optional[LogsQueryClient] = None,
+    workspace_id: str,
+    kql: str,
+    timerange_hours: int = 24,
+    limit: Optional[int] = None,
 ) -> Dict[str, Any]:
-    sys_c = (threat_hunt_system_message.get("content") or "")
-    usr_c = (threat_hunt_user_message.get("content") or "")
-    if "json" not in sys_c.lower() and "json" not in usr_c.lower():
-        threat_hunt_system_message = {
-            **threat_hunt_system_message,
-            "content": sys_c + "\n\nYou MUST output valid json.",
+    """
+    Execute a raw KQL query against Log Analytics.
+    """
+    client = log_analytics_client or law_client
+    if client is None:
+        raise ValueError("Missing LogsQueryClient: pass log_analytics_client (or law_client).")
+
+    hours = max(1, _safe_int(timerange_hours, 24))
+    q = (kql or "").strip()
+    if not q:
+        raise ValueError("kql is empty")
+
+    # Optional safety cap
+    if limit is not None:
+        lim = max(1, _safe_int(limit, 2000))
+        lower = q.lower()
+        if " take " not in lower and "|take" not in lower and " limit " not in lower and "|limit" not in lower:
+            q = f"{q}\n| take {lim}"
+
+    resp = client.query_workspace(
+        workspace_id=workspace_id,
+        query=q,
+        timespan=timedelta(hours=hours),
+    )
+
+    if resp.status != LogsQueryStatus.SUCCESS:
+        partial_records: List[Dict[str, Any]] = []
+        if getattr(resp, "partial_data", None):
+            for t in resp.partial_data:
+                partial_records.extend(_table_to_records(t))
+
+        return {
+            "ok": False,
+            "query": q,
+            "hours": hours,
+            "error": str(resp.error) if getattr(resp, "error", None) else "Query failed",
+            "rows": partial_records,
+            "csv": records_to_csv(partial_records),
         }
 
-    resp = openai_client.chat.completions.create(
-        model=openai_model,
-        messages=[threat_hunt_system_message, threat_hunt_user_message],
-        response_format={"type": "json_object"},
+    records: List[Dict[str, Any]] = []
+    for t in resp.tables or []:
+        records.extend(_table_to_records(t))
+
+    return {
+        "ok": True,
+        "query": q,
+        "hours": hours,
+        "rows": records,
+        "csv": records_to_csv(records),
+    }
+
+
+def query_log_analytics(
+    *,
+    # accept either name
+    law_client: Optional[LogsQueryClient] = None,
+    log_analytics_client: Optional[LogsQueryClient] = None,
+    workspace_id: str,
+
+    # allow either style: "kql_query" or "kql"
+    kql_query: Optional[str] = None,
+    kql: Optional[str] = None,
+
+    # old/new time keyword aliases
+    timespan_hours: Optional[int] = None,
+    timerange_hours: int = 24,
+    hours: Optional[int] = None,
+
+    # optional
+    limit: int = 2000,
+) -> Dict[str, Any]:
+    """
+    Backward-compatible wrapper around run_kql_query.
+    """
+    resolved_hours = timerange_hours
+    if hours is not None:
+        resolved_hours = hours
+    elif timespan_hours is not None:
+        resolved_hours = timespan_hours
+
+    resolved_hours = max(1, _safe_int(resolved_hours, 24))
+
+    query = (kql_query if kql_query is not None else kql) or ""
+    query = str(query)
+
+    return run_kql_query(
+        law_client=law_client,
+        log_analytics_client=log_analytics_client,
+        workspace_id=workspace_id,
+        kql=query,
+        timerange_hours=resolved_hours,
+        limit=limit,
     )
-
-    raw = resp.choices[0].message.content
-    if not raw:
-        return {}
-
-    try:
-        return json.loads(raw)
-    except Exception:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(raw[start:end + 1])
-        raise
