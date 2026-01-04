@@ -1,5 +1,19 @@
+# KILLCHAIN.py
+# -------------------------------------------------------------------
+# Kill chain utilities
+#
+# This module powers two different use-cases:
+# 1) Agent pipeline (heuristic step runner): run_killchain(...)
+# 2) API/UI summaries (lightweight aggregation): summarize_kill_chain(...)
+#
+# ✅ Adding summarize_kill_chain is NON-DESTRUCTIVE:
+# - Does not change run_killchain behavior
+# - Simply provides a stable function for the UI API layer to call
+# -------------------------------------------------------------------
+
 # Standard library
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
+from collections import Counter
 
 # Local modules (these should exist as separate files)
 # If you haven't created some yet, comment them out for now.
@@ -80,3 +94,98 @@ def run_killchain(
     report["next_pivots"] = deduped
 
     return report
+
+
+# -------------------------------------------------------------------
+# UI/API helper (non-destructive)
+# -------------------------------------------------------------------
+
+def summarize_kill_chain(
+    device_logons: Optional[List[Dict[str, Any]]] = None,
+    device_net: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Lightweight kill-chain-ish summary for the UI layer.
+
+    This does NOT run the full heuristic step pipeline.
+    It simply summarizes common indicators from the provided rows, so the
+    UI can display a stable, fast "overview" without heavy analysis.
+
+    Args:
+        device_logons: List of logon-like rows (dicts)
+        device_net: List of network-like rows (dicts)
+
+    Returns:
+        dict suitable for the UI to render:
+        {
+          "observed_stages": [...],
+          "signals": [...],
+          "score": int,
+          "top_users": [...],
+          "top_devices": [...],
+          "notes": str
+        }
+    """
+    device_logons = device_logons or []
+    device_net = device_net or []
+
+    signals: List[str] = []
+    observed: List[str] = []
+    score = 0
+
+    # Helper: pull a field if it exists under several common names
+    def pick(row: Dict[str, Any], *keys: str) -> Any:
+        for k in keys:
+            if k in row and row.get(k) not in (None, ""):
+                return row.get(k)
+        return None
+
+    # Count top users/devices from whatever fields we have
+    user_counter = Counter()
+    device_counter = Counter()
+
+    for r in device_logons:
+        user = pick(r, "Account", "User", "UserPrincipalName", "TargetUserName", "InitiatingProcessAccountName")
+        dev = pick(r, "DeviceName", "Computer", "Device", "HostName")
+        if user:
+            user_counter[str(user)] += 1
+        if dev:
+            device_counter[str(dev)] += 1
+
+    for r in device_net:
+        dev = pick(r, "DeviceName", "Computer", "Device", "HostName")
+        if dev:
+            device_counter[str(dev)] += 1
+
+    # Very lightweight “stage” inference based on presence of data
+    if len(device_logons) > 0:
+        observed.append("Initial Access")
+        signals.append(f"Observed {len(device_logons)} authentication-related events (last window).")
+        score += 1
+
+    if len(device_net) > 0:
+        observed.append("Command & Control")
+        signals.append(f"Observed {len(device_net)} network-related events (last window).")
+        score += 1
+
+    # Add “hot” entities if any
+    top_users = [{"name": u, "events": c} for u, c in user_counter.most_common(8)]
+    top_devices = [{"name": d, "events": c} for d, c in device_counter.most_common(8)]
+
+    if top_users:
+        signals.append(f"Top user by event volume: {top_users[0]['name']} ({top_users[0]['events']}).")
+    if top_devices:
+        signals.append(f"Top device by event volume: {top_devices[0]['name']} ({top_devices[0]['events']}).")
+
+    notes = (
+        "UI summary only (lightweight). For full heuristics, the agent uses run_killchain()."
+    )
+
+    return {
+        "observed_stages": observed,
+        "signals": signals,
+        "score": score,
+        "top_users": top_users,
+        "top_devices": top_devices,
+        "notes": notes,
+    }

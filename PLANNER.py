@@ -4,12 +4,17 @@
 # - Ask LLM for 1-3 pivot steps (JSON only)
 # - Sanitize each step (table/fields/time range)
 # - Execute pivots via your query runner (EXECUTOR.query_log_analytics)
+#
+# ✅ Also includes a lightweight UI/API helper:
+#   cluster_campaigns(device_logons, device_net)
+#   (non-destructive: does not affect agent behavior)
 # ------------------------------------------------------------
 
 import json
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+from collections import Counter, defaultdict
 
 import UTILITIES
 import GUARDRAILS
@@ -257,3 +262,100 @@ def run_planner_pivots(
 
     UTILITIES.log_event("planner_done", {"pivot_counts": pivot_counts})
     return {"steps": steps, "pivot_blocks": pivot_blocks.strip(), "pivot_counts": pivot_counts}
+
+
+# -------------------------------------------------------------------
+# UI/API helper (non-destructive)
+# -------------------------------------------------------------------
+
+def cluster_campaigns(
+    device_logons: Optional[List[Dict[str, Any]]] = None,
+    device_net: Optional[List[Dict[str, Any]]] = None,
+    max_clusters: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    Lightweight "campaign clustering" for the UI layer.
+
+    This is NOT the LLM pivot planner. It doesn't call OpenAI.
+    It simply groups events into small clusters using a basic heuristic:
+      - device name (DeviceName/Computer/HostName)
+      - remote IP (RemoteIP/RemoteUrl/IpAddress)
+      - account/user (Account/User/UPN)
+
+    Returns a UI-friendly list:
+    [
+      {
+        "id": "CMP-1",
+        "key": "device:mm-final-lab",
+        "risk": 0-100,
+        "cases": int,
+        "entities": int,
+        "top_entities": [...],
+      },
+      ...
+    ]
+    """
+    device_logons = device_logons or []
+    device_net = device_net or []
+
+    def pick(row: Dict[str, Any], *keys: str) -> Any:
+        for k in keys:
+            if k in row and row.get(k) not in (None, ""):
+                return row.get(k)
+        return None
+
+    buckets = defaultdict(list)
+
+    # Bucket logons
+    for r in device_logons:
+        dev = pick(r, "DeviceName", "Computer", "HostName", "Device") or "unknown-device"
+        user = pick(r, "Account", "User", "UserPrincipalName", "TargetUserName") or ""
+        key = f"device:{dev}"
+        if user:
+            key = f"{key}|user:{user}"
+        buckets[key].append(r)
+
+    # Bucket network events
+    for r in device_net:
+        dev = pick(r, "DeviceName", "Computer", "HostName", "Device") or "unknown-device"
+        rip = pick(r, "RemoteIP", "RemoteUrl", "RemoteIPCountry", "IpAddress") or ""
+        key = f"device:{dev}"
+        if rip:
+            key = f"{key}|remote:{rip}"
+        buckets[key].append(r)
+
+    clusters = []
+    for idx, (k, rows) in enumerate(sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)[:max_clusters], start=1):
+        # crude "risk": scaled by volume
+        volume = len(rows)
+        risk = min(100, max(5, int(volume ** 0.6 * 10)))
+
+        # entity extraction
+        entities = set()
+        for rr in rows:
+            dev = pick(rr, "DeviceName", "Computer", "HostName", "Device")
+            user = pick(rr, "Account", "User", "UserPrincipalName", "TargetUserName")
+            rip = pick(rr, "RemoteIP", "RemoteUrl", "IpAddress")
+            if dev:
+                entities.add(f"device:{dev}")
+            if user:
+                entities.add(f"user:{user}")
+            if rip:
+                entities.add(f"remote:{rip}")
+
+        ent_counts = Counter()
+        for e in entities:
+            ent_counts[e] += 1
+
+        clusters.append(
+            {
+                "id": f"CMP-{idx}",
+                "key": k,
+                "risk": risk,
+                "cases": 1,  # UI placeholder (can map to cases later)
+                "entities": len(entities),
+                "top_entities": [e for e, _ in ent_counts.most_common(6)],
+            }
+        )
+
+    return clusters
