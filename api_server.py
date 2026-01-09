@@ -1,19 +1,19 @@
-
 # api_server.py
 # -------------------------------------------------------------------
 # Agentic SOC Engine API (FastAPI)
 #
-# Phase 2 goal:
-# - Expose live telemetry endpoints your UI can call
-# - Provide an /api/intel/overview endpoint (your browser is hitting this)
-#
-# Uses your existing executor:
-#   EXECUTOR.query_log_analytics(law_client, kql_query, workspace_id, timespan_hours)
+# ✅ Minimal-change upgrade:
+# - Keeps /api/hunt (raw KQL) exactly as-is
+# - Adds /api/hunt/smart which accepts either:
+#     • raw KQL  (runs directly)
+#     • natural-language prompt (LLM translates -> KQL -> runs)
 # -------------------------------------------------------------------
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+import os
+import re
 import traceback
 
 from fastapi import FastAPI, HTTPException
@@ -30,12 +30,12 @@ from _config import LOG_ANALYTICS_WORKSPACE_ID
 # -----------------------------
 # App + Clients
 # -----------------------------
-app = FastAPI(title="Agentic SOC Engine API", version="2.0")
+app = FastAPI(title="Agentic SOC Engine API", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",  # Next.js dev
+        "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
@@ -55,6 +55,11 @@ class HuntRequest(BaseModel):
     hours: int = 24
 
 
+class SmartHuntRequest(BaseModel):
+    prompt: str
+    hours: int = 24
+
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -69,10 +74,6 @@ def _require_workspace_id() -> str:
 
 
 def run_kql(kql: str, hours: int = 24) -> Dict[str, Any]:
-    """
-    Runs KQL through your existing EXECUTOR.query_log_analytics so we keep
-    one consistent query path across CLI engine + API.
-    """
     ws = _require_workspace_id()
 
     try:
@@ -83,20 +84,13 @@ def run_kql(kql: str, hours: int = 24) -> Dict[str, Any]:
             timespan_hours=hours,
         )
 
-        # Normalize: always return a dict with ok + rows
         ok = bool(result.get("ok", False))
         rows = result.get("rows", []) or []
         error = result.get("error") if not ok else None
 
-        return {
-            "ok": ok,
-            "rows": rows,
-            "count": len(rows),
-            "error": error,
-        }
+        return {"ok": ok, "rows": rows, "count": len(rows), "error": error}
 
     except Exception as e:
-        # Don’t hide the real reason — return it safely to the caller
         tb = traceback.format_exc()
         return {
             "ok": False,
@@ -108,10 +102,6 @@ def run_kql(kql: str, hours: int = 24) -> Dict[str, Any]:
 
 
 def pick_first_ok(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Try multiple queries; return the first successful one.
-    If all fail, return the *most informative* failure.
-    """
     first_fail = None
     for r in results:
         if r.get("ok"):
@@ -119,6 +109,76 @@ def pick_first_ok(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         if first_fail is None:
             first_fail = r
     return first_fail or {"ok": False, "rows": [], "count": 0, "error": "No results"}
+
+
+def looks_like_kql(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    if "|" in t:
+        return True
+
+    # single token like "Heartbeat"
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", t):
+        return True
+
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*\|", t):
+        return True
+
+    return False
+
+
+def _get_openai_client():
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail="openai package not installed. Run: python3 -m pip install openai",
+        ) from e
+
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY not set (.env). Needed for natural-language prompts.",
+        )
+
+    return OpenAI(api_key=api_key)
+
+
+def translate_prompt_to_kql(prompt: str, hours: int) -> str:
+    client = _get_openai_client()
+    model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+
+    system = (
+        "You translate analyst natural-language requests into KQL for Azure Log Analytics.\n"
+        "Return ONLY valid KQL. No markdown. No explanations.\n"
+        f"If time filtering is needed, use: TimeGenerated >= ago({hours}h).\n"
+        "Prefer common tables if appropriate: Heartbeat, SecurityEvent, SigninLogs, DeviceLogonEvents.\n"
+        "If the request is ambiguous, choose a reasonable common table and keep output simple.\n"
+    )
+
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        kql = (resp.output_text or "").strip()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to translate prompt: {type(e).__name__}: {e}",
+        )
+
+    if not kql:
+        raise HTTPException(status_code=500, detail="Failed to translate prompt to KQL (empty result).")
+
+    return kql.replace("```kql", "").replace("```", "").strip()
 
 
 # -----------------------------
@@ -132,73 +192,65 @@ def health():
 
 @app.post("/api/hunt")
 def api_hunt(req: HuntRequest):
-    """
-    Generic KQL endpoint (useful for debugging from browser/Postman/UI).
-    """
     resp = run_kql(req.kql, hours=req.hours)
     if not resp.get("ok"):
-        # Return a helpful 500 with the actual KQL failure details
         raise HTTPException(status_code=500, detail=resp.get("error", "KQL query failed"))
     return resp
 
 
+@app.post("/api/hunt/smart")
+def api_hunt_smart(req: SmartHuntRequest):
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    if looks_like_kql(prompt):
+        kql_used = prompt
+        input_type = "kql"
+    else:
+        kql_used = translate_prompt_to_kql(prompt, hours=req.hours)
+        input_type = "natural_language"
+
+    resp = run_kql(kql_used, hours=req.hours)
+    if not resp.get("ok"):
+        raise HTTPException(status_code=500, detail=resp.get("error", "KQL query failed"))
+
+    return {**resp, "kql_used": kql_used, "input_type": input_type, "hours": req.hours}
+
+
 @app.get("/api/intel/overview")
 def intel_overview(hours: int = 24):
-    """
-    Returns a small "Command Center" style summary from live telemetry.
-
-    IMPORTANT:
-    Workspace schemas vary wildly. To avoid constant breakage,
-    we try a few common tables and pick the first one that works.
-    """
-
-    # 1) Candidate queries for "logon-style" telemetry
     logon_candidates = [
-        # Microsoft Defender for Endpoint (if piped into LA)
         f"""
 DeviceLogonEvents
 | where TimeGenerated >= ago({hours}h)
-| summarize
-    total=count(),
-    devices=dcount(DeviceName),
-    users=dcount(AccountName)
+| summarize total=count(), devices=dcount(DeviceName), users=dcount(AccountName)
 """,
-        # Windows SecurityEvent (classic)
         f"""
 SecurityEvent
 | where TimeGenerated >= ago({hours}h)
 | where EventID in (4624,4625)
-| summarize
-    total=count(),
-    devices=dcount(Computer),
-    users=dcount(Account)
+| summarize total=count(), devices=dcount(Computer), users=dcount(Account)
 """,
-        # Azure AD sign-in logs (if connected)
         f"""
 SigninLogs
 | where TimeGenerated >= ago({hours}h)
-| summarize
-    total=count(),
-    users=dcount(UserPrincipalName),
-    apps=dcount(AppDisplayName)
+| summarize total=count(), users=dcount(UserPrincipalName), apps=dcount(AppDisplayName)
 """,
     ]
 
-    summary_attempts = [run_kql(kql, hours=hours) for kql in logon_candidates]
-    summary = pick_first_ok(summary_attempts)
+    summary = pick_first_ok([run_kql(kql, hours=hours) for kql in logon_candidates])
 
     if not summary.get("ok"):
-        # Don’t 500 with a blank page — return a structured error payload.
         return {
             "ok": False,
             "hours": hours,
             "error": summary.get("error", "Failed to query workspace"),
-            "hint": "Your workspace may not have DeviceLogonEvents/SecurityEvent/SigninLogs. Try /api/hunt with a known-good table.",
+            "hint": "Workspace may not have DeviceLogonEvents/SecurityEvent/SigninLogs. Try /api/hunt with Heartbeat | take 10.",
         }
 
     row0 = (summary.get("rows") or [{}])[0]
 
-    # 2) Top entities/devices (best-effort)
     top_devices_candidates = [
         f"""
 DeviceLogonEvents
@@ -213,22 +265,20 @@ SecurityEvent
 | top 8 by events desc
 """,
     ]
+
     top_devices = pick_first_ok([run_kql(kql, hours=hours) for kql in top_devices_candidates])
     devices_list = []
     if top_devices.get("ok"):
         for r in top_devices.get("rows", []):
-            # normalize either DeviceName or Computer
             name = r.get("DeviceName") or r.get("Computer") or ""
             devices_list.append({"name": str(name), "events": int(r.get("events", 0) or 0)})
 
-    # 3) Return overview payload
     return {
         "ok": True,
         "hours": hours,
         "source_table_hint": "auto",
         "summary": row0,
         "top_devices": devices_list,
-        # placeholders your UI can later expand:
         "campaigns": [],
         "mitre": [],
         "lateral": [],
