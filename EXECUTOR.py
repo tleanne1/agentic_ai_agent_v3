@@ -13,18 +13,30 @@
 #     - objects with .name
 #     - strings
 #     - dict-like shapes
+#
+# ✅ Minimal-change "Demo Mode" (portfolio-safe):
+#   - Set ENGINE_MODE=demo to bypass Azure and return deterministic mock telemetry
+#   - Default is live (Azure)
 # -------------------------------------------------------------------
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import os
+import re
 import csv
 import io
 
 from azure.monitor.query import LogsQueryClient
 from azure.monitor.query import LogsQueryStatus
+
+
+# -----------------------------
+# Demo Mode Settings
+# -----------------------------
+ENGINE_MODE = (os.getenv("ENGINE_MODE") or "live").strip().lower()
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
@@ -103,6 +115,172 @@ def records_to_csv(records: List[Dict[str, Any]]) -> str:
     return buf.getvalue()
 
 
+# -----------------------------
+# Demo Mode Helpers (minimal)
+# -----------------------------
+_DEMO_NOW = datetime.now(timezone.utc)
+
+
+def _demo_rows_for_table(table: str) -> List[Dict[str, Any]]:
+    """
+    Deterministic, portfolio-safe mock telemetry.
+    Keep this small but realistic.
+    """
+    t = (table or "").strip()
+
+    # Heartbeat (sanity check)
+    if t.lower() == "heartbeat":
+        return [
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=2)).isoformat(),
+                "Computer": "windows-target-1",
+                "Category": "Direct Agent",
+                "OSName": "Windows",
+                "SourceSystem": "OpsManager",
+                "TenantId": "00000000-0000-0000-0000-000000000000",
+            },
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=5)).isoformat(),
+                "Computer": "linux-target-1",
+                "Category": "Direct Agent",
+                "OSName": "Linux",
+                "SourceSystem": "OpsManager",
+                "TenantId": "00000000-0000-0000-0000-000000000000",
+            },
+        ]
+
+    # Defender for Endpoint-style table
+    if t.lower() == "devicelogonevents":
+        return [
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=12)).isoformat(),
+                "DeviceName": "windows-target-1",
+                "AccountName": "jsmith",
+                "UserPrincipalName": "jsmith@contoso.local",
+                "ActionType": "LogonSuccess",
+                "RemoteIP": "198.51.100.24",
+                "LogonType": "Interactive",
+            },
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=11)).isoformat(),
+                "DeviceName": "windows-target-1",
+                "AccountName": "jsmith",
+                "UserPrincipalName": "jsmith@contoso.local",
+                "ActionType": "LogonFailed",
+                "RemoteIP": "203.0.113.77",
+                "LogonType": "RemoteInteractive",
+            },
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=10)).isoformat(),
+                "DeviceName": "linux-target-1",
+                "AccountName": "root",
+                "UserPrincipalName": "",
+                "ActionType": "LogonFailed",
+                "RemoteIP": "203.0.113.77",
+                "LogonType": "SSH",
+            },
+        ]
+
+    # Classic Windows Security Event
+    if t.lower() == "securityevent":
+        return [
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=15)).isoformat(),
+                "Computer": "windows-target-1",
+                "EventID": 4625,
+                "Account": "jsmith",
+                "Activity": "Logon Failure",
+                "IpAddress": "203.0.113.77",
+                "LogonType": 10,
+            },
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=14)).isoformat(),
+                "Computer": "windows-target-1",
+                "EventID": 4624,
+                "Account": "jsmith",
+                "Activity": "Logon Success",
+                "IpAddress": "198.51.100.24",
+                "LogonType": 2,
+            },
+        ]
+
+    # Azure AD Sign-in
+    if t.lower() == "signinlogs":
+        return [
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=25)).isoformat(),
+                "UserPrincipalName": "jsmith@contoso.local",
+                "AppDisplayName": "Microsoft Teams",
+                "Status": "Success",
+                "IPAddress": "198.51.100.24",
+                "Location": "US",
+            },
+            {
+                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=23)).isoformat(),
+                "UserPrincipalName": "jsmith@contoso.local",
+                "AppDisplayName": "Azure Portal",
+                "Status": "Failure",
+                "IPAddress": "203.0.113.77",
+                "Location": "RU",
+            },
+        ]
+
+    # Unknown table -> empty
+    return []
+
+
+def _extract_table_name(kql: str) -> str:
+    """
+    Very small heuristic:
+    - First non-empty line
+    - First token is usually the table name
+    """
+    q = (kql or "").strip()
+    if not q:
+        return ""
+    first_line = q.splitlines()[0].strip()
+    # table could be like: DeviceLogonEvents | where ...
+    token = first_line.split()[0].strip()
+    # strip any leading pipes (just in case)
+    token = token.lstrip("|").strip()
+    return token
+
+
+def _extract_take_limit(kql: str, default_limit: int = 2000) -> int:
+    """
+    Parse 'take N' or 'limit N' from KQL. If none, return default.
+    """
+    q = (kql or "").lower()
+    m = re.search(r"\b(?:take|limit)\s+(\d+)\b", q)
+    if m:
+        return max(1, _safe_int(m.group(1), default_limit))
+    return default_limit
+
+
+def _run_demo_query(kql: str, hours: int, limit: Optional[int]) -> Dict[str, Any]:
+    """
+    Demo-mode response shaped EXACTLY like live mode.
+    """
+    q = (kql or "").strip()
+    if not q:
+        return {"ok": False, "query": q, "hours": hours, "error": "kql is empty", "rows": [], "csv": ""}
+
+    table = _extract_table_name(q)
+    rows = _demo_rows_for_table(table)
+
+    # Apply limit (prefer explicit take/limit in query)
+    eff_limit = _extract_take_limit(q, default_limit=(limit or 2000))
+    rows = rows[: eff_limit]
+
+    return {
+        "ok": True if rows is not None else False,
+        "query": q,
+        "hours": hours,
+        "rows": rows or [],
+        "csv": records_to_csv(rows or []),
+    }
+
+
 def run_kql_query(
     *,
     law_client: Optional[LogsQueryClient] = None,
@@ -115,16 +293,21 @@ def run_kql_query(
     """
     Execute a raw KQL query against Log Analytics.
     """
+    hours = max(1, _safe_int(timerange_hours, 24))
+    q = (kql or "").strip()
+
+    # ✅ Demo mode bypasses Azure completely
+    if ENGINE_MODE == "demo":
+        return _run_demo_query(q, hours=hours, limit=limit)
+
     client = log_analytics_client or law_client
     if client is None:
         raise ValueError("Missing LogsQueryClient: pass log_analytics_client (or law_client).")
 
-    hours = max(1, _safe_int(timerange_hours, 24))
-    q = (kql or "").strip()
     if not q:
         raise ValueError("kql is empty")
 
-    # Optional safety cap
+    # Optional safety cap (live mode only)
     if limit is not None:
         lim = max(1, _safe_int(limit, 2000))
         lower = q.lower()
