@@ -7,6 +7,10 @@
 # - Adds /api/hunt/smart which accepts either:
 #     • raw KQL  (runs directly)
 #     • natural-language prompt (LLM translates -> KQL -> runs)
+#
+# ✅ Mode badge support (minimal):
+# - /health now returns {"mode": "live" | "demo"} in addition to existing fields
+# - Set ENGINE_MODE=demo in your engine .env (or export in shell) to switch
 # -------------------------------------------------------------------
 
 from __future__ import annotations
@@ -187,7 +191,14 @@ def translate_prompt_to_kql(prompt: str, hours: int) -> str:
 @app.get("/health")
 def health():
     ws = (LOG_ANALYTICS_WORKSPACE_ID or "").strip()
-    return {"ok": True, "workspace_id_set": bool(ws)}
+
+    # ✅ Minimal addition for the UI "Mode" badge (default: live)
+    # Set ENGINE_MODE=demo later when you add demo-mode endpoints/data.
+    mode = (os.getenv("ENGINE_MODE") or "live").strip().lower()
+    if mode not in ("live", "demo"):
+        mode = "live"
+
+    return {"ok": True, "workspace_id_set": bool(ws), "mode": mode}
 
 
 @app.post("/api/hunt")
