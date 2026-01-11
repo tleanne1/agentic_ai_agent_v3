@@ -1,121 +1,68 @@
-🧠 agentic_ai_agent_v3
-Autonomous SOC Threat Hunting Engine
-Agentic SOC Engine – Autonomous Threat Hunting Platform
+# 🧠 Agentic SOC Engine  
+### AI Threat Hunting Core
 
-Author: Tracey Buentello
-Role: SOC Engineer / Threat Hunter
-Platform Type: Cognitive SOC Analysis Engine
-Status: Portfolio-grade SOC simulation platform
-Supports: Live Azure Telemetry & Demo SOC Environments
+**Author:** Tracey Buentello  
+**Platform Type:** AI-Powered SOC Automation Engine  
+**Purpose:** Cognitive threat hunting, baselining, kill-chain analysis, and escalation decision support  
 
-Platforms and Languages Leveraged
-Platforms
+---
 
-Microsoft Defender for Endpoint (MDE)
+## 🧱 Platform Stack
 
-Azure Log Analytics Workspace
+- Python 3.10+  
+- Azure Log Analytics (KQL)  
+- Microsoft Defender for Endpoint (MDE)  
+- OpenAI (LLM cognitive layer)  
+- REST API endpoints  
+- Token-safe evidence pipelines  
 
-Windows & Linux corporate endpoints
+---
 
-OpenAI Cognitive Analysis Models
+## 🎯 What This Is
 
-Languages / Tools
+Agentic SOC Engine is an AI-driven SOC automation core that performs:
 
-Python
+- Cognitive threat hunts  
+- Log baselining & anomaly detection  
+- Kill-chain mapping & escalation logic  
+- Automated pivot hunting  
+- Response guidance and isolation decisioning  
 
-Kusto Query Language (KQL)
+> It acts as a **virtual Tier-2/3 SOC analyst**.
 
-Azure Monitor SDK
+---
 
-OpenAI API
+## 🧩 Core Capabilities
 
-PowerShell (optional containment actions)
+| Capability | Description |
+|----------|-------------|
+| Cognitive Hunting | Converts analyst intent into safe KQL |
+| Baseline Modeling | Learns normal activity patterns |
+| Pivot Hunting | Auto-generates follow-up hunts |
+| Kill-Chain Analysis | Maps attacker stage progression |
+| Escalation Logic | Determines risk and response actions |
+| Evidence Clamping | Prevents token overflows |
+| Defender Integration | Machine isolation & response |
+| Analyst Safety | Guardrails for dangerous input |
 
-Purpose
+---
 
-This engine simulates how a real Security Operations Center triages, pivots, escalates, and prioritizes security telemetry — from analyst intent to kill-chain assessment and executive reporting.
+## 🔁 SOC Automation Flow
 
-Unlike rule-based tools, this engine accepts natural language SOC prompts and performs:
+1. Analyst submits hunt intent  
+2. AI selects correct log source & fields  
+3. KQL is generated and safely executed  
+4. Baselines & anomalies are analyzed  
+5. Kill-chain stage is identified  
+6. Escalation logic determines severity  
+7. Analyst is guided through response  
 
-Automated query construction
+---
 
-Telemetry execution
+## 🔌 Integrated Data Sources
 
-Baseline anomaly detection
-
-Pivot investigation
-
-Kill-chain modeling
-
-Escalation scoring
-
-LLM-driven cognitive hunting
-
-Executive SOC summary generation
-
-SOC Workflow Simulated
-Phase	What the Engine Does
-Detection	Translates analyst intent into KQL telemetry hunts
-Triage	Builds safe query contexts and executes telemetry
-Baseline	Detects rare or unusual behavior
-Investigation	Auto-pivots related telemetry
-Kill Chain	Scores compromise progression
-Escalation	Calculates severity & response readiness
-Cognitive Hunt	LLM interprets telemetry for hidden threats
-Reporting	Generates executive SOC summaries
-Containment	Advisory-only isolation (human-approved)
-Example SOC Hunt Flow
-
-Prompt Entered
-
-Hunt suspicious logons on all devices in the last 24 hours
-
-
-Engine Automatically Performs
-
-Selects DeviceLogonEvents telemetry
-
-Builds time-bound KQL queries
-
-Executes baseline anomaly detection
-
-Generates pivot evidence
-
-Runs kill-chain progression analysis
-
-Produces escalation scoring
-
-Runs LLM cognitive hunt
-
-Outputs executive SOC summary
-
-Executive SOC Output (Example)
-Section	Description
-Targets	Affected endpoints
-Anomalies	Rare or abnormal behavior
-Kill Chain	Observed compromise stages
-Escalation	SOC action readiness
-Findings	Cognitive threat results
-Isolation	Human-approved containment status
-SOC Guardrails
-
-❌ No automated blocking
-
-❌ No forced containment
-
-❌ No destructive actions
-
-✔ Advisory-only decision engine
-
-✔ Human approval required
-
-Repository Modules
-Module	Function
-EXECUTOR.py	Telemetry execution
-BASELINES.py	Behavioral anomaly baselines
-PLANNER.py	Pivot investigation logic
-KILLCHAIN.py	Compromise modeling
-PROMPT_MANAGEMENT.py	LLM prompt shaping
-GUARDRAILS.py	Safety and injection defense
-_main.py	CLI SOC console
-api_server.py	REST interface for UI
+- DeviceLogonEvents  
+- DeviceProcessEvents  
+- DeviceNetworkEvents  
+- DeviceFileEvents  
+- IdentityLogonEv
