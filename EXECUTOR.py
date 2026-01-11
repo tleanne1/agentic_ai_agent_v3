@@ -1,43 +1,43 @@
 # EXECUTOR.py
 # -------------------------------------------------------------------
-# Query execution utilities for Log Analytics + safe parsing helpers
+# Engine-compatible EXECUTOR for agentic_ai_agent_v3
 #
-# ✅ Backward compatible:
-#   - accepts law_client or log_analytics_client
-#   - accepts kql_query or kql
-#   - accepts timespan_hours or timerange_hours
-#   - accepts hours (alias)
+# This file matches the function signatures expected by your current main.py:
+#   ✅ get_query_context(openai_client, user_message, model=...)
+#   ✅ query_log_analytics(... table_name, device_name, fields, user_principal_name ...)
+#   ✅ prepare_log_data_for_llm(records_csv, number_of_records)
+#   ✅ hunt(openai_client, threat_hunt_system_message, threat_hunt_user_message, openai_model)
 #
-# ✅ Robust column parsing:
-#   Azure tables sometimes return columns as:
-#     - objects with .name
-#     - strings
-#     - dict-like shapes
-#
-# ✅ Minimal-change "Demo Mode" (portfolio-safe):
-#   - Set ENGINE_MODE=demo to bypass Azure and return deterministic mock telemetry
-#   - Default is live (Azure)
+# Also includes:
+#   ✅ Live mode (Log Analytics) + Demo mode (ENGINE_MODE=demo)
+#   ✅ Robust azure column parsing
+#   ✅ Safe stubs for isolate/release (advisory-only)
 # -------------------------------------------------------------------
 
 from __future__ import annotations
-
-from datetime import timedelta, datetime, timezone
-from typing import Any, Dict, List, Optional
 
 import os
 import re
 import csv
 import io
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 from azure.monitor.query import LogsQueryClient
 from azure.monitor.query import LogsQueryStatus
 
-
-# -----------------------------
-# Demo Mode Settings
-# -----------------------------
 ENGINE_MODE = (os.getenv("ENGINE_MODE") or "live").strip().lower()
 
+# Payload clamps used for prompt safety
+MAX_EVIDENCE_ROWS = 400
+MAX_EVIDENCE_CHARS = 80_000
+
+_DEMO_NOW = datetime.now(timezone.utc)
+
+
+# -------------------------------------------------------------------
+# Internal helpers
+# -------------------------------------------------------------------
 
 def _safe_int(v: Any, default: int = 0) -> int:
     try:
@@ -46,40 +46,34 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return default
 
 
+def _as_list(v: Any) -> List[Any]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    return [v]
+
+
 def _col_name(c: Any) -> str:
-    """
-    Azure table columns may be:
-      - object with .name
-      - plain string
-      - dict-like
-    """
     if c is None:
         return ""
     if isinstance(c, str):
         return c
-    # Column-like object
     if hasattr(c, "name"):
         try:
             return str(getattr(c, "name"))
         except Exception:
             pass
-    # Dict-like fallback
     if isinstance(c, dict) and "name" in c:
         return str(c.get("name"))
-    # Last resort
     return str(c)
 
 
 def _table_to_records(table: Any) -> List[Dict[str, Any]]:
-    """
-    Convert Azure LogsQueryResult table -> list[dict]
-    """
     if table is None:
         return []
-
     raw_cols = getattr(table, "columns", None) or []
     cols = [_col_name(c) for c in raw_cols]
-
     rows = getattr(table, "rows", None) or []
 
     out: List[Dict[str, Any]] = []
@@ -91,14 +85,10 @@ def _table_to_records(table: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def records_to_csv(records: List[Dict[str, Any]]) -> str:
-    """
-    list[dict] -> csv text (header + rows)
-    """
+def _records_to_csv(records: List[Dict[str, Any]]) -> str:
     if not records:
         return ""
 
-    # union of keys (stable order: keys from first row, then others)
     fieldnames = list(records[0].keys())
     seen = set(fieldnames)
     for r in records[1:]:
@@ -115,42 +105,310 @@ def records_to_csv(records: List[Dict[str, Any]]) -> str:
     return buf.getvalue()
 
 
-# -----------------------------
-# Demo Mode Helpers (minimal)
-# -----------------------------
-_DEMO_NOW = datetime.now(timezone.utc)
+def _extract_hours_from_text(text: str, default_hours: int = 24) -> int:
+    t = (text or "").lower()
+
+    # "last 24 hours"
+    m = re.search(r"last\s+(\d+)\s*h", t)
+    if m:
+        return max(1, _safe_int(m.group(1), default_hours))
+
+    m = re.search(r"(\d+)\s*hours", t)
+    if m:
+        return max(1, _safe_int(m.group(1), default_hours))
+
+    # "last 7 days"
+    m = re.search(r"last\s+(\d+)\s*days", t)
+    if m:
+        return max(1, _safe_int(m.group(1), 1) * 24)
+
+    # "last day"
+    if "last day" in t or "past day" in t:
+        return 24
+
+    return default_hours
 
 
-def _demo_rows_for_table(table: str) -> List[Dict[str, Any]]:
+def _extract_device_from_text(text: str) -> str:
     """
-    Deterministic, portfolio-safe mock telemetry.
-    Keep this small but realistic.
+    Simple heuristic to capture your lab device naming style:
+    - windows-target-1
+    - linux-target-1
+    - etc.
     """
-    t = (table or "").strip()
+    t = (text or "")
+    m = re.search(r"\b([a-zA-Z]+-target-\d+)\b", t)
+    if m:
+        return m.group(1).strip()
+    return ""
 
-    # Heartbeat (sanity check)
-    if t.lower() == "heartbeat":
-        return [
-            {
-                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=2)).isoformat(),
-                "Computer": "windows-target-1",
-                "Category": "Direct Agent",
-                "OSName": "Windows",
-                "SourceSystem": "OpsManager",
-                "TenantId": "00000000-0000-0000-0000-000000000000",
-            },
-            {
-                "TimeGenerated": (_DEMO_NOW - timedelta(minutes=5)).isoformat(),
-                "Computer": "linux-target-1",
-                "Category": "Direct Agent",
-                "OSName": "Linux",
-                "SourceSystem": "OpsManager",
-                "TenantId": "00000000-0000-0000-0000-000000000000",
-            },
+
+def _choose_table_and_fields(user_text: str) -> Dict[str, Any]:
+    """
+    Lightweight tool-selection fallback (keeps engine working for recording).
+    """
+    t = (user_text or "").lower()
+
+    # Defaults: logons
+    table = "DeviceLogonEvents"
+    fields = [
+        "TimeGenerated",
+        "DeviceName",
+        "AccountName",
+        "UserPrincipalName",
+        "ActionType",
+        "RemoteIP",
+        "LogonType",
+    ]
+
+    if "signin" in t or "azure ad" in t or "entra" in t:
+        table = "SigninLogs"
+        fields = [
+            "TimeGenerated",
+            "UserPrincipalName",
+            "AppDisplayName",
+            "Status",
+            "IPAddress",
+            "Location",
+        ]
+    elif "securityevent" in t or "event id" in t or "4624" in t or "4625" in t:
+        table = "SecurityEvent"
+        fields = [
+            "TimeGenerated",
+            "Computer",
+            "EventID",
+            "Account",
+            "Activity",
+            "IpAddress",
+            "LogonType",
         ]
 
-    # Defender for Endpoint-style table
-    if t.lower() == "devicelogonevents":
+    return {"table_name": table, "fields": fields}
+
+
+def _build_kql(
+    *,
+    table_name: str,
+    hours: int,
+    fields: List[str],
+    device_name: str = "",
+    user_principal_name: str = "",
+) -> str:
+    table = (table_name or "").strip()
+    f = [x for x in (fields or []) if str(x).strip()] or ["TimeGenerated"]
+
+    where_parts = [f"TimeGenerated >= ago({hours}h)"]
+
+    if device_name:
+        where_parts.append(
+            f'(DeviceName has "{device_name}" or Computer has "{device_name}" or HostName has "{device_name}")'
+        )
+
+    if user_principal_name:
+        where_parts.append(
+            f'(UserPrincipalName has "{user_principal_name}" or AccountName has "{user_principal_name}" or Account has "{user_principal_name}")'
+        )
+
+    return (
+        f"{table}\n"
+        f"| where {' and '.join(where_parts)}\n"
+        f"| project {', '.join(f)}\n"
+        f"| take 2000"
+    )
+
+
+# -------------------------------------------------------------------
+# ✅ REQUIRED BY main.py: get_query_context
+# -------------------------------------------------------------------
+
+def get_query_context(openai_client: Any, user_message: Dict[str, Any], model: str = "") -> Dict[str, Any]:
+    """
+    Engine-compatible tool selection:
+    - Keeps the same interface your main.py calls
+    - Uses deterministic heuristics (safe for recording)
+    """
+    _ = openai_client
+    _ = model
+
+    user_text = (user_message.get("content") or "").strip()
+    hours = _extract_hours_from_text(user_text, default_hours=24)
+    device = _extract_device_from_text(user_text)
+
+    pick = _choose_table_and_fields(user_text)
+
+    return {
+        "table_name": pick["table_name"],
+        "time_range_hours": hours,
+        "device_name": device,                 # empty => global hunt
+        "caller": "security_team",
+        "user_principal_name": "",
+        "fields": pick["fields"],
+        "rationale": "Heuristic tool selection (recording-safe fallback).",
+    }
+
+
+# -------------------------------------------------------------------
+# ✅ REQUIRED BY main.py: query_log_analytics
+# -------------------------------------------------------------------
+
+def query_log_analytics(
+    *,
+    law_client: Optional[LogsQueryClient] = None,
+    log_analytics_client: Optional[LogsQueryClient] = None,
+    workspace_id: str,
+    timerange_hours: int = 24,
+    table_name: str,
+    device_name: str = "",
+    fields: Optional[List[str]] = None,
+    caller: str = "",
+    user_principal_name: str = "",
+    limit: int = 2000,
+) -> Dict[str, Any]:
+    """
+    Runs a KQL query shaped the way main.py expects.
+
+    Returns:
+      {
+        "ok": bool,
+        "kql": str,
+        "count": int,
+        "records": csv_text
+      }
+    """
+    _ = caller
+
+    hours = max(1, _safe_int(timerange_hours, 24))
+    resolved_fields = [str(x) for x in _as_list(fields)] if fields else ["TimeGenerated"]
+
+    kql = _build_kql(
+        table_name=table_name,
+        hours=hours,
+        fields=resolved_fields,
+        device_name=(device_name or "").strip(),
+        user_principal_name=(user_principal_name or "").strip(),
+    )
+
+    # Demo mode: deterministic mock telemetry
+    if ENGINE_MODE == "demo":
+        rows = _demo_rows_for_table(table_name)[: max(1, _safe_int(limit, 2000))]
+        csv_text = _records_to_csv(rows)
+        return {"ok": True, "kql": kql, "count": len(rows), "records": csv_text}
+
+    client = log_analytics_client or law_client
+    if client is None:
+        raise ValueError("Missing LogsQueryClient: pass log_analytics_client (or law_client).")
+
+    resp = client.query_workspace(
+        workspace_id=workspace_id,
+        query=kql,
+        timespan=timedelta(hours=hours),
+    )
+
+    if resp.status != LogsQueryStatus.SUCCESS:
+        partial_records: List[Dict[str, Any]] = []
+        if getattr(resp, "partial_data", None):
+            for t in resp.partial_data:
+                partial_records.extend(_table_to_records(t))
+
+        csv_text = _records_to_csv(partial_records)
+        return {"ok": False, "kql": kql, "count": len(partial_records), "records": csv_text, "error": str(getattr(resp, "error", ""))}
+
+    records: List[Dict[str, Any]] = []
+    for t in resp.tables or []:
+        records.extend(_table_to_records(t))
+
+    # Apply hard limit if caller didn't specify take/limit
+    records = records[: max(1, _safe_int(limit, 2000))]
+    csv_text = _records_to_csv(records)
+    return {"ok": True, "kql": kql, "count": len(records), "records": csv_text}
+
+
+# -------------------------------------------------------------------
+# ✅ REQUIRED BY main.py: prepare_log_data_for_llm
+# -------------------------------------------------------------------
+
+def prepare_log_data_for_llm(records_csv: str, number_of_records: int) -> str:
+    """
+    main.py calls: EXECUTOR.prepare_log_data_for_llm(records_csv, number_of_records)
+
+    We keep header + first MAX_EVIDENCE_ROWS rows, and clamp chars.
+    """
+    _ = number_of_records
+
+    if not records_csv:
+        return ""
+
+    lines = records_csv.splitlines()
+    if not lines:
+        return ""
+
+    header = lines[:1]
+    body = lines[1 : MAX_EVIDENCE_ROWS + 1]
+    payload = "\n".join(header + body)
+
+    if len(lines) > (MAX_EVIDENCE_ROWS + 1):
+        payload += f"\n...TRUNCATED ROWS... ({len(lines) - (MAX_EVIDENCE_ROWS + 1)} more)"
+
+    if len(payload) > MAX_EVIDENCE_CHARS:
+        payload = payload[:MAX_EVIDENCE_CHARS] + "\n...TRUNCATED CHARS..."
+
+    return payload
+
+
+# -------------------------------------------------------------------
+# ✅ REQUIRED BY main.py: hunt
+# -------------------------------------------------------------------
+
+def hunt(
+    *,
+    openai_client: Any,
+    threat_hunt_system_message: Dict[str, Any],
+    threat_hunt_user_message: Dict[str, Any],
+    openai_model: str,
+) -> Dict[str, Any]:
+    """
+    Runs the LLM step and returns {"findings": [...]}.
+
+    Designed to be resilient across OpenAI SDK minor differences.
+    """
+    try:
+        # Newer SDKs support response_format directly
+        resp = openai_client.chat.completions.create(
+            model=openai_model,
+            messages=[threat_hunt_system_message, threat_hunt_user_message],
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content or "{}"
+    except TypeError:
+        # Fallback: no response_format
+        resp = openai_client.chat.completions.create(
+            model=openai_model,
+            messages=[threat_hunt_system_message, threat_hunt_user_message],
+        )
+        content = resp.choices[0].message.content or "{}"
+    except Exception as e:
+        return {"ok": False, "error": str(e), "findings": []}
+
+    # Parse JSON safely
+    import json
+    try:
+        data = json.loads(content)
+        findings = data.get("findings") or []
+        if not isinstance(findings, list):
+            findings = []
+        return {"ok": True, "findings": findings, "raw": data}
+    except Exception:
+        return {"ok": True, "findings": [], "raw_text": content}
+
+
+# -------------------------------------------------------------------
+# Demo data (used when ENGINE_MODE=demo)
+# -------------------------------------------------------------------
+
+def _demo_rows_for_table(table: str) -> List[Dict[str, Any]]:
+    t = (table or "").strip().lower()
+
+    if t == "devicelogonevents":
         return [
             {
                 "TimeGenerated": (_DEMO_NOW - timedelta(minutes=12)).isoformat(),
@@ -181,8 +439,7 @@ def _demo_rows_for_table(table: str) -> List[Dict[str, Any]]:
             },
         ]
 
-    # Classic Windows Security Event
-    if t.lower() == "securityevent":
+    if t == "securityevent":
         return [
             {
                 "TimeGenerated": (_DEMO_NOW - timedelta(minutes=15)).isoformat(),
@@ -204,8 +461,7 @@ def _demo_rows_for_table(table: str) -> List[Dict[str, Any]]:
             },
         ]
 
-    # Azure AD Sign-in
-    if t.lower() == "signinlogs":
+    if t == "signinlogs":
         return [
             {
                 "TimeGenerated": (_DEMO_NOW - timedelta(minutes=25)).isoformat(),
@@ -225,167 +481,16 @@ def _demo_rows_for_table(table: str) -> List[Dict[str, Any]]:
             },
         ]
 
-    # Unknown table -> empty
     return []
 
 
-def _extract_table_name(kql: str) -> str:
-    """
-    Very small heuristic:
-    - First non-empty line
-    - First token is usually the table name
-    """
-    q = (kql or "").strip()
-    if not q:
-        return ""
-    first_line = q.splitlines()[0].strip()
-    # table could be like: DeviceLogonEvents | where ...
-    token = first_line.split()[0].strip()
-    # strip any leading pipes (just in case)
-    token = token.lstrip("|").strip()
-    return token
+# -------------------------------------------------------------------
+# Advisory-only stubs (keep engine stable)
+# -------------------------------------------------------------------
+
+def isolate_vm_by_name(*args, **kwargs) -> Dict[str, Any]:
+    return {"ok": False, "error": "isolate_vm_by_name not configured in this build (advisory-only)."}
 
 
-def _extract_take_limit(kql: str, default_limit: int = 2000) -> int:
-    """
-    Parse 'take N' or 'limit N' from KQL. If none, return default.
-    """
-    q = (kql or "").lower()
-    m = re.search(r"\b(?:take|limit)\s+(\d+)\b", q)
-    if m:
-        return max(1, _safe_int(m.group(1), default_limit))
-    return default_limit
-
-
-def _run_demo_query(kql: str, hours: int, limit: Optional[int]) -> Dict[str, Any]:
-    """
-    Demo-mode response shaped EXACTLY like live mode.
-    """
-    q = (kql or "").strip()
-    if not q:
-        return {"ok": False, "query": q, "hours": hours, "error": "kql is empty", "rows": [], "csv": ""}
-
-    table = _extract_table_name(q)
-    rows = _demo_rows_for_table(table)
-
-    # Apply limit (prefer explicit take/limit in query)
-    eff_limit = _extract_take_limit(q, default_limit=(limit or 2000))
-    rows = rows[: eff_limit]
-
-    return {
-        "ok": True if rows is not None else False,
-        "query": q,
-        "hours": hours,
-        "rows": rows or [],
-        "csv": records_to_csv(rows or []),
-    }
-
-
-def run_kql_query(
-    *,
-    law_client: Optional[LogsQueryClient] = None,
-    log_analytics_client: Optional[LogsQueryClient] = None,
-    workspace_id: str,
-    kql: str,
-    timerange_hours: int = 24,
-    limit: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Execute a raw KQL query against Log Analytics.
-    """
-    hours = max(1, _safe_int(timerange_hours, 24))
-    q = (kql or "").strip()
-
-    # ✅ Demo mode bypasses Azure completely
-    if ENGINE_MODE == "demo":
-        return _run_demo_query(q, hours=hours, limit=limit)
-
-    client = log_analytics_client or law_client
-    if client is None:
-        raise ValueError("Missing LogsQueryClient: pass log_analytics_client (or law_client).")
-
-    if not q:
-        raise ValueError("kql is empty")
-
-    # Optional safety cap (live mode only)
-    if limit is not None:
-        lim = max(1, _safe_int(limit, 2000))
-        lower = q.lower()
-        if " take " not in lower and "|take" not in lower and " limit " not in lower and "|limit" not in lower:
-            q = f"{q}\n| take {lim}"
-
-    resp = client.query_workspace(
-        workspace_id=workspace_id,
-        query=q,
-        timespan=timedelta(hours=hours),
-    )
-
-    if resp.status != LogsQueryStatus.SUCCESS:
-        partial_records: List[Dict[str, Any]] = []
-        if getattr(resp, "partial_data", None):
-            for t in resp.partial_data:
-                partial_records.extend(_table_to_records(t))
-
-        return {
-            "ok": False,
-            "query": q,
-            "hours": hours,
-            "error": str(resp.error) if getattr(resp, "error", None) else "Query failed",
-            "rows": partial_records,
-            "csv": records_to_csv(partial_records),
-        }
-
-    records: List[Dict[str, Any]] = []
-    for t in resp.tables or []:
-        records.extend(_table_to_records(t))
-
-    return {
-        "ok": True,
-        "query": q,
-        "hours": hours,
-        "rows": records,
-        "csv": records_to_csv(records),
-    }
-
-
-def query_log_analytics(
-    *,
-    # accept either name
-    law_client: Optional[LogsQueryClient] = None,
-    log_analytics_client: Optional[LogsQueryClient] = None,
-    workspace_id: str,
-
-    # allow either style: "kql_query" or "kql"
-    kql_query: Optional[str] = None,
-    kql: Optional[str] = None,
-
-    # old/new time keyword aliases
-    timespan_hours: Optional[int] = None,
-    timerange_hours: int = 24,
-    hours: Optional[int] = None,
-
-    # optional
-    limit: int = 2000,
-) -> Dict[str, Any]:
-    """
-    Backward-compatible wrapper around run_kql_query.
-    """
-    resolved_hours = timerange_hours
-    if hours is not None:
-        resolved_hours = hours
-    elif timespan_hours is not None:
-        resolved_hours = timespan_hours
-
-    resolved_hours = max(1, _safe_int(resolved_hours, 24))
-
-    query = (kql_query if kql_query is not None else kql) or ""
-    query = str(query)
-
-    return run_kql_query(
-        law_client=law_client,
-        log_analytics_client=log_analytics_client,
-        workspace_id=workspace_id,
-        kql=query,
-        timerange_hours=resolved_hours,
-        limit=limit,
-    )
+def release_vm_by_name(*args, **kwargs) -> Dict[str, Any]:
+    return {"ok": False, "error": "release_vm_by_name not configured in this build (advisory-only)."}
