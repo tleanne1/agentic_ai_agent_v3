@@ -7,6 +7,20 @@
 
 ---
 
+## 🎥 Live SOC Engine Demo
+
+▶ Watch the full demo:  
+https://www.linkedin.com/posts/activity-7416285113862373376-QAoQ
+
+This live demo shows:
+- Analyst-intent driven threat hunts  
+- Baseline anomaly detection  
+- Automated pivot hunting  
+- Kill-chain mapping & escalation decisioning  
+- Executive summary generation  
+
+---
+
 ## 🧱 Platform Stack
 
 - Python 3.10+  
