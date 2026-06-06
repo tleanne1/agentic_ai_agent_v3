@@ -65,32 +65,42 @@ The objective is to increase analyst efficiency, consistency, and investigative 
 
 # 🏗️ Architecture
 
-The platform follows a structured investigation workflow designed around safety, explainability, and analyst oversight.
+#### AI Security Architecture
 
-## Core Workflow
+```mermaid
+flowchart TD
 
-```text
-Analyst Input
-      ↓
-Planner Engine
-      ↓
-Guardrail Validation
-      ↓
-KQL Generation
-      ↓
-Azure Log Analytics
-      ↓
-Baseline Analysis
-      ↓
-Threat Analysis (LLM)
-      ↓
-Kill Chain Mapping
-      ↓
-Escalation Logic
-      ↓
-Analyst Review
-      ↓
-Optional Response Action
+    A[Analyst Request]
+
+    A --> B[Planner Engine]
+
+    B --> C[Prompt Injection Detection]
+
+    C --> D[Allowed Tables Validation]
+
+    D --> E[Allowed Fields Validation]
+
+    E --> F[Query Safety Checks]
+
+    F --> G[KQL Generation]
+
+    G --> H[Azure Log Analytics]
+
+    H --> I[Threat Analysis]
+
+    I --> J[MITRE Mapping]
+
+    J --> K[Kill Chain Assessment]
+
+    K --> L[Escalation Recommendation]
+
+    L --> M[Analyst Review]
+
+    M --> N{Approve Action?}
+
+    N -->|No| O[Investigation Closed]
+
+    N -->|Yes| P[MDE Isolation Action]
 ```
 
 ## Core Components
