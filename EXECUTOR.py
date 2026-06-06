@@ -1,3 +1,20 @@
+"""
+Agentic SOC Engine
+
+Copyright (c) 2026 Tracey Buentello
+
+All Rights Reserved.
+
+This source code is provided for portfolio,
+educational, and evaluation purposes only.
+
+Unauthorized copying, redistribution,
+modification, commercial use, or reproduction
+of substantial portions of this software
+is prohibited without written permission.
+"""
+
+
 # EXECUTOR.py
 # -------------------------------------------------------------------
 # Engine-compatible EXECUTOR for agentic_ai_agent_v3
