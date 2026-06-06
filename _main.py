@@ -1,11 +1,17 @@
 """
 Agentic SOC Engine
+
 Copyright (c) 2026 Tracey Buentello
 
-Provided for portfolio and research purposes.
+All Rights Reserved.
 
-Unauthorized redistribution,
-commercial use, or reproduction prohibited.
+This source code is provided for portfolio,
+educational, and evaluation purposes only.
+
+Unauthorized copying, redistribution,
+modification, commercial use, or reproduction
+of substantial portions of this software
+is prohibited without written permission.
 """
 
 # main.py
