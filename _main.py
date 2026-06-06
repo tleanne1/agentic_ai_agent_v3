@@ -1,3 +1,13 @@
+"""
+Agentic SOC Engine
+Copyright (c) 2026 Tracey Buentello
+
+Provided for portfolio and research purposes.
+
+Unauthorized redistribution,
+commercial use, or reproduction prohibited.
+"""
+
 # main.py
 # -------------------------------------------------------------------
 # Agentic SOC Analyst (Beginner-friendly main loop)
