@@ -65,42 +65,58 @@ The objective is to increase analyst efficiency, consistency, and investigative 
 
 # 🏗️ Architecture
 
-#### AI Security Architecture
+The platform follows a structured investigation workflow designed around safety, explainability, and analyst oversight.
 
 ```mermaid
-flowchart TD
+flowchart LR
 
-    A[Analyst Request]
+    Analyst[Security Analyst]
 
-    A --> B[Planner Engine]
+    subgraph Agentic_SOC_Engine
 
-    B --> C[Prompt Injection Detection]
+        Planner[Planner Engine]
 
-    C --> D[Allowed Tables Validation]
+        Guardrails[Guardrail Framework]
 
-    D --> E[Allowed Fields Validation]
+        Baselines[Behavioral Baselines]
 
-    E --> F[Query Safety Checks]
+        ThreatAnalysis[AI Threat Analysis]
 
-    F --> G[KQL Generation]
+        MITRE[MITRE ATT&CK Mapping]
 
-    G --> H[Azure Log Analytics]
+        KillChain[Kill Chain Engine]
 
-    H --> I[Threat Analysis]
+        Escalation[Escalation Logic]
 
-    I --> J[MITRE Mapping]
+    end
 
-    J --> K[Kill Chain Assessment]
+    subgraph Telemetry
 
-    K --> L[Escalation Recommendation]
+        LogAnalytics[Azure Log Analytics]
 
-    L --> M[Analyst Review]
+        MDE[Microsoft Defender]
 
-    M --> N{Approve Action?}
+    end
 
-    N -->|No| O[Investigation Closed]
+    Analyst --> Planner
 
-    N -->|Yes| P[MDE Isolation Action]
+    Planner --> Guardrails
+
+    Guardrails --> LogAnalytics
+
+    LogAnalytics --> Baselines
+
+    Baselines --> ThreatAnalysis
+
+    ThreatAnalysis --> MITRE
+
+    MITRE --> KillChain
+
+    KillChain --> Escalation
+
+    Escalation --> Analyst
+
+    Analyst --> MDE
 ```
 
 ## Core Components
@@ -132,6 +148,35 @@ flowchart TD
 # 🔍 Threat Hunting Workflow
 
 The platform follows a structured investigation methodology designed to reduce analyst workload while maintaining investigative rigor.
+
+
+```mermaid
+flowchart TD
+
+    A[Analyst Hunt Request]
+
+    A --> B[Investigation Planning]
+
+    B --> C[Guardrail Validation]
+
+    C --> D[Telemetry Collection]
+
+    D --> E[Behavioral Baseline Analysis]
+
+    E --> F[AI Threat Analysis]
+
+    F --> G[MITRE ATT&CK Mapping]
+
+    G --> H[Kill Chain Assessment]
+
+    H --> I[Escalation Recommendation]
+
+    I --> J[Analyst Review]
+
+    J --> K[Containment Decision]
+
+    K --> L[Executive Summary]
+```
 
 ## Investigation Flow
 
@@ -196,6 +241,42 @@ Containment actions require analyst approval.
 # 🛡️ Guardrail Framework
 
 Security and safety controls are implemented throughout the platform to prevent unsafe AI behavior.
+
+
+```mermaid
+flowchart TD
+
+    A[Analyst Input]
+
+    A --> B[Prompt Injection Detection]
+
+    B --> C[Allowed Tables Validation]
+
+    C --> D[Allowed Fields Validation]
+
+    D --> E[Query Safety Checks]
+
+    E --> F[KQL Generation]
+
+    F --> G[Azure Log Analytics]
+
+    G --> H[Threat Analysis]
+
+    H --> I[MITRE Mapping]
+
+    I --> J[Kill Chain Assessment]
+
+    J --> K[Escalation Recommendation]
+
+    K --> L[Analyst Review]
+
+    L --> M{Approve Action?}
+
+    M -->|No| N[Investigation Complete]
+
+    M -->|Yes| O[MDE Isolation Action]
+```
+
 
 ## Query Validation
 
