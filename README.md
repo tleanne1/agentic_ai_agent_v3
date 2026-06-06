@@ -100,3 +100,11 @@ Agentic SOC Engine is an AI-driven SOC automation core that performs:
 - DeviceNetworkEvents  
 - DeviceFileEvents  
 - IdentityLogonEv
+
+
+## Author
+Built and maintained by Tracey Buentello.
+
+This project demonstrates AI-assisted threat hunting,
+security automation, detection engineering,
+and SOC workflow orchestration.
